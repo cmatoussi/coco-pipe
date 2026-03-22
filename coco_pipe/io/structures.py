@@ -41,6 +41,7 @@ import fnmatch
 import itertools
 import logging
 import re
+import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -1221,26 +1222,48 @@ class DataContainer:
         return self.center(dim=dim, inplace=inplace)
 
     def aggregate(
-        self, by: Union[str, np.ndarray, List[Any]], method: str = "mean"
+        self,
+        by: Union[str, np.ndarray, List[Any]],
+        stats: Union[str, Sequence[str]] = "mean",
+        min_count: int = 1,
+        on_insufficient: str = "raise",
     ) -> "DataContainer":
         """
-        Aggregate observations by groups (vectorized implementation).
+        Aggregate observations into grouped summaries along the ``obs`` axis.
 
         Parameters
         ----------
         by : str or array-like
-            The key defining the groups.
-            - If str: It looks up the key in `self.coords` (e.g., 'subject_id')
-              or checks `self.y` if by='y'.
-            - If array: A sequence of labels matching the length of the 'obs'
-              dimension.
-        method : str, default='mean'
-            Aggregation method. Options: 'mean', 'median', 'std'.
+            Group definition for the observation axis.
+            - If str: resolve the key from ``self.coords`` or from ``self.y``
+              when ``by == "y"``.
+            - If array-like: explicit group labels aligned with ``obs``.
+        stats : str or sequence of str, default="mean"
+            Aggregation statistic or ordered list of statistics. Supported
+            tokens are ``"mean"``, ``"median"``, ``"std"``, ``"var"``,
+            ``"sem"``, ``"min"``, ``"max"``, ``"count"``, and ``"first"``.
+            Legacy ``"obs-*"`` aliases are accepted and normalized.
+        min_count : int, default=1
+            Minimum number of valid observations required per group. A valid
+            observation is one with at least one finite value across the
+            non-observation axes.
+        on_insufficient : {"raise", "warn", "collect"}, default="raise"
+            Policy applied when a group has fewer than ``min_count`` valid
+            observations.
 
         Returns
         -------
         DataContainer
-             DataContainer with aggregated 'obs' dimension.
+            Aggregated container with grouped observations on the ``obs`` axis.
+            When multiple stats are requested, a ``stat`` dimension is inserted
+            immediately after ``obs``.
+
+        Raises
+        ------
+        ValueError
+            If the container has no ``obs`` dimension, grouping is invalid,
+            requested stats are unsupported, or ``min_count`` /
+            ``on_insufficient`` are invalid.
         """
         if "obs" not in self.dims:
             raise ValueError("Aggregation requires 'obs' dimension.")
@@ -1248,107 +1271,266 @@ class DataContainer:
         obs_idx = self.dims.index("obs")
         n_obs = self.X.shape[obs_idx]
 
-        # Resolve 'by' to labels
+        if min_count < 1:
+            raise ValueError("`min_count` must be at least 1.")
+        if on_insufficient not in {"raise", "warn", "collect"}:
+            raise ValueError("`on_insufficient` must be one of: raise, warn, collect.")
+
+        stat_aliases = {
+            "obs-mean": "mean",
+            "obs-median": "median",
+            "obs-std": "std",
+            "obs-var": "var",
+            "obs-sem": "sem",
+            "obs-min": "min",
+            "obs-max": "max",
+            "obs-count": "count",
+        }
+        supported_stats = {
+            "mean",
+            "median",
+            "std",
+            "var",
+            "sem",
+            "min",
+            "max",
+            "count",
+            "first",
+        }
+        if isinstance(stats, str):
+            stats_out = [stat_aliases.get(stats, stats)]
+        else:
+            stats_out = [stat_aliases.get(str(stat), str(stat)) for stat in stats]
+        if not stats_out:
+            raise ValueError("`stats` must not be empty.")
+        invalid_stats = sorted(set(stats_out) - supported_stats)
+        if invalid_stats:
+            raise ValueError(
+                f"Unknown stats: {invalid_stats}. Supported stats are: "
+                f"{sorted(supported_stats)}"
+            )
+
         if isinstance(by, str):
             if by == "y" and self.y is not None:
-                groups = self.y
+                groups_raw = self.y
             elif by in self.coords:
-                groups = self.coords[by]
+                groups_raw = self.coords[by]
             else:
                 raise ValueError(f"Grouping key '{by}' not found in coords or y.")
         else:
-            groups = np.array(by)
+            groups_raw = by
+
+        labels_list = list(groups_raw)
+        groups = np.empty(len(labels_list), dtype=object)
+        groups[:] = labels_list
 
         if len(groups) != n_obs:
             raise ValueError(
                 f"Grouping array length {len(groups)} must match obs length {n_obs}."
             )
 
-        # Transform inputs for DataFrame-based GroupBy (Vectorized)
-        # 1. Flatten X to (n_obs, n_features_flat)
-        # We need to reshape specifically so obs is axis 0, and rest is flattened
         if obs_idx != 0:
-            # Move obs to front if not already
             X_moved = np.moveaxis(self.X, obs_idx, 0)
         else:
             X_moved = self.X
 
-        original_shape = X_moved.shape
-        X_flat = X_moved.reshape(original_shape[0], -1)
+        other_dims = tuple(dim for dim in self.dims if dim != "obs")
+        group_positions: Dict[Any, List[int]] = {}
+        ordered_groups: List[Any] = []
+        for obs_position, group_id in enumerate(groups.tolist()):
+            if group_id not in group_positions:
+                ordered_groups.append(group_id)
+                group_positions[group_id] = []
+            group_positions[group_id].append(obs_position)
 
-        # 2. Create DataFrame
-        # Using numeric index for columns to avoid overhead
-        df = pd.DataFrame(X_flat)
-        df["__group__"] = groups
+        def _reshape_reduced(values_flat: np.ndarray) -> np.ndarray | np.float64:
+            if rest_shape:
+                return np.asarray(values_flat, dtype=np.float64).reshape(rest_shape)
+            return np.asarray(values_flat, dtype=np.float64)[0]
 
-        # 3. Groupby & Aggregate
-        grouped = df.groupby("__group__")
+        def _reduce_group(
+            group_X: np.ndarray,
+            group_X_flat: np.ndarray,
+            counts_flat: np.ndarray,
+            stat: str,
+        ) -> np.ndarray | np.float64:
+            if stat == "count":
+                return _reshape_reduced(counts_flat)
+            if stat == "first":
+                return np.asarray(group_X[0], dtype=np.float64)
 
-        if method == "mean":
-            agg_df = grouped.mean()
-        elif method == "median":
-            agg_df = grouped.median()
-        elif method == "std":
-            agg_df = grouped.std()
-        elif method == "first":
-            agg_df = grouped.first()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                if stat == "mean":
+                    values_flat = np.nanmean(group_X_flat, axis=0)
+                elif stat == "median":
+                    values_flat = np.nanmedian(group_X_flat, axis=0)
+                elif stat == "std":
+                    values_flat = np.nanstd(group_X_flat, axis=0)
+                elif stat == "var":
+                    values_flat = np.nanvar(group_X_flat, axis=0)
+                elif stat == "sem":
+                    values_flat = np.nanstd(group_X_flat, axis=0) / np.sqrt(
+                        counts_flat.astype(np.float64)
+                    )
+                elif stat == "min":
+                    values_flat = np.nanmin(group_X_flat, axis=0)
+                elif stat == "max":
+                    values_flat = np.nanmax(group_X_flat, axis=0)
+                else:  # pragma: no cover - guarded above
+                    raise ValueError(f"Unknown stat '{stat}'")
+
+            values_flat = np.asarray(values_flat, dtype=np.float64)
+            if counts_flat.size:
+                values_flat = np.where(counts_flat == 0, np.nan, values_flat)
+            return _reshape_reduced(values_flat)
+
+        def _failure_record(
+            group_id: Any,
+            group_index: int,
+            row_count: int,
+            valid_row_count: int,
+            message: str,
+        ) -> Dict[str, Any]:
+            return {
+                "group_id": group_id,
+                "group_index": group_index,
+                "row_count": row_count,
+                "valid_row_count": valid_row_count,
+                "exception_type": "InsufficientObservations",
+                "message": message,
+            }
+
+        n_groups = len(ordered_groups)
+        rest_shape = X_moved.shape[1:]
+        reduced_shape = (n_groups, len(stats_out)) + rest_shape
+        agg_moved = np.empty(reduced_shape, dtype=np.float64)
+        epoch_counts = np.empty(n_groups, dtype=np.int64)
+        failures: List[Dict[str, Any]] = []
+
+        for group_index, group_id in enumerate(ordered_groups):
+            obs_positions = np.asarray(group_positions[group_id], dtype=int)
+            group_X = X_moved[obs_positions]
+            row_count = int(obs_positions.size)
+            epoch_counts[group_index] = row_count
+
+            if rest_shape:
+                group_X_flat = group_X.reshape(row_count, -1)
+            else:
+                group_X_flat = group_X.reshape(row_count, 1)
+            if group_X_flat.shape[1] == 0:
+                valid_row_count = row_count
+            else:
+                valid_row_count = int(np.isfinite(group_X_flat).any(axis=1).sum())
+            if valid_row_count < min_count:
+                message = (
+                    f"Group {group_id!r} has {valid_row_count} valid rows, "
+                    f"requires at least {min_count}."
+                )
+                failure = _failure_record(
+                    group_id=group_id,
+                    group_index=group_index,
+                    row_count=row_count,
+                    valid_row_count=valid_row_count,
+                    message=message,
+                )
+                if on_insufficient == "raise":
+                    raise ValueError(message)
+                if on_insufficient == "warn":
+                    warnings.warn(message, stacklevel=2)
+                failures.append(failure)
+                agg_moved[group_index] = np.full((len(stats_out),) + rest_shape, np.nan)
+                continue
+
+            counts_flat = np.isfinite(group_X_flat).sum(axis=0, dtype=np.int64)
+            for stat_index, stat in enumerate(stats_out):
+                agg_moved[group_index, stat_index] = _reduce_group(
+                    group_X=group_X,
+                    group_X_flat=group_X_flat,
+                    counts_flat=counts_flat,
+                    stat=stat,
+                )
+
+        if len(stats_out) == 1:
+            moved_dims = ("obs",) + other_dims
+            final_dims = self.dims
+            agg_values = agg_moved[:, 0, ...]
         else:
-            raise ValueError(f"Unknown method '{method}'")
+            moved_dims = ("obs", "stat") + other_dims
+            final_dims_list: List[str] = []
+            for dim in self.dims:
+                final_dims_list.append(dim)
+                if dim == "obs":
+                    final_dims_list.append("stat")
+            final_dims = tuple(final_dims_list)
+            agg_values = agg_moved
 
-        # 4. Extract Result
-        # agg_df index is the unique groups (sorted)
-        unique_groups = agg_df.index.to_numpy()
-        X_agg_flat = agg_df.values  # (n_groups, n_features_flat)
+        permutation = [moved_dims.index(dim) for dim in final_dims]
+        X_agg = np.transpose(agg_values, axes=permutation)
 
-        # 5. Reshape back
-        new_shape = (len(unique_groups),) + original_shape[1:]
-        X_agg_moved = X_agg_flat.reshape(new_shape)
+        unique_groups = np.empty(n_groups, dtype=object)
+        unique_groups[:] = ordered_groups
 
-        if obs_idx != 0:
-            X_agg = np.moveaxis(X_agg_moved, 0, obs_idx)
-        else:
-            X_agg = X_agg_moved
-
-        # 6. Metadata Handling (y consistency)
         new_y = None
         if self.y is not None:
-            # Check if y is consistent per group
-            y_df = pd.DataFrame({"g": groups, "y": self.y})
-            y_nunique = y_df.groupby("g")["y"].nunique()
-            if y_nunique.max() == 1:
-                # Take first
-                new_y = y_df.groupby("g")["y"].first().reindex(unique_groups).values
+            grouped_y: List[Any] = []
+            y_consistent = True
+            for group_id in ordered_groups:
+                values = np.asarray(self.y)[group_positions[group_id]]
+                if len(set(values.tolist())) != 1:
+                    y_consistent = False
+                    break
+                grouped_y.append(values[0])
+            if y_consistent:
+                new_y = np.asarray(grouped_y)
 
-        # 7. Update Coords
-        new_coords = self.coords.copy()
+        new_coords = {
+            dim: deepcopy(values)
+            for dim, values in self.coords.items()
+            if dim in self.dims and dim != "obs"
+        }
         new_coords["obs"] = unique_groups
+        if len(stats_out) > 1:
+            new_coords["stat"] = np.asarray(stats_out, dtype=object)
+        new_coords["epoch_count"] = epoch_counts
 
-        for k, v in self.coords.items():
-            if k == "obs":
+        for key, values in self.coords.items():
+            if key == "obs" or key in self.dims:
                 continue
-            if len(v) == n_obs and k not in self.dims:
-                coord_df = pd.DataFrame({"g": groups, "value": np.array(v)})
-                coord_nunique = coord_df.groupby("g")["value"].nunique(dropna=False)
-                if coord_nunique.max() == 1:
-                    new_coords[k] = (
-                        coord_df.groupby("g")["value"]
-                        .first()
-                        .reindex(unique_groups)
-                        .values
-                    )
-                else:
-                    del new_coords[k]
+            if len(values) != n_obs:
+                continue
+            grouped_values: List[Any] = []
+            consistent = True
+            values_array = np.asarray(values, dtype=object)
+            for group_id in ordered_groups:
+                group_values = values_array[group_positions[group_id]]
+                if len(set(group_values.tolist())) != 1:
+                    consistent = False
+                    break
+                grouped_values.append(group_values[0])
+            if consistent:
+                coord_out = np.empty(n_groups, dtype=object)
+                coord_out[:] = grouped_values
+                new_coords[key] = coord_out
+
+        meta = deepcopy(self.meta)
+        meta.update(
+            {
+                "aggregated": True,
+                "agg_by": by if isinstance(by, str) else None,
+                "agg_stats": list(stats_out),
+                "min_count": int(min_count),
+            }
+        )
+        if failures:
+            meta["aggregate_failures"] = failures
 
         return replace(
             self,
             X=X_agg,
             y=new_y,
-            ids=unique_groups if method != "std" else None,
+            dims=final_dims,
+            ids=unique_groups,
             coords=new_coords,
-            meta={
-                **self.meta,
-                "aggregated": True,
-                "agg_by": str(by),
-                "agg_method": method,
-            },
+            meta=meta,
         )

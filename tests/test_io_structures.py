@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from coco_pipe.descriptors import DescriptorPipeline
 from coco_pipe.io.structures import DataContainer
 
 
@@ -328,31 +329,175 @@ def test_aggregate():
         dc.aggregate(by=[1, 2])
 
     # 4. Aggregation Mean (Standard)
-    agg = dc.aggregate(by="Study ID", method="mean")
+    agg = dc.aggregate(by="Study ID", stats="mean")
     assert agg.shape == (2, 2)
     assert np.array_equal(agg.coords["obs"], ["A", "B"])
     assert np.array_equal(agg.coords["Study ID"], ["A", "B"])
     assert np.array_equal(agg.coords["site"], ["north", "south"])
     assert "mixed" not in agg.coords
+    assert np.array_equal(agg.coords["epoch_count"], [2, 1])
     # Group A: (1+2)/2 = 1.5. Group B: 3.
     assert agg.X[0, 0] == 1.5
     assert agg.y is not None
     assert np.array_equal(agg.y, [0, 1])  # 0 is consistent for A
 
     # 5. Method variants
-    agg_std = dc.aggregate(by="Study ID", method="std")
-    assert agg_std.ids is None  # Std voids IDs
+    agg_std = dc.aggregate(by="Study ID", stats="std")
+    assert np.array_equal(agg_std.ids, ["A", "B"])
 
-    with pytest.raises(ValueError, match="Unknown method"):
-        dc.aggregate(by="Study ID", method="invalid")
+    with pytest.raises(ValueError, match="Unknown stats"):
+        dc.aggregate(by="Study ID", stats="invalid")
 
 
 def test_aggregate_unknown_method():
     """Test unknown aggregation method error."""
     X = np.zeros((2, 2))
     dc = DataContainer(X, dims=("obs", "f"))
-    with pytest.raises(ValueError, match="Unknown method"):
-        dc.aggregate(by=[1, 2], method="magic")
+    with pytest.raises(ValueError, match="Unknown stats"):
+        dc.aggregate(by=[1, 2], stats="magic")
+
+
+def _make_descriptor_container(X, *, descriptor_names=None):
+    return DataContainer(
+        X=np.asarray(X, dtype=np.float32),
+        dims=("obs", "feature"),
+        coords={
+            "feature": descriptor_names or ["alpha_ch-all", "beta_ch-all"],
+        },
+    )
+
+
+def _make_grouped_descriptor_container():
+    return _make_descriptor_container(
+        [
+            [np.nan, 1.0],
+            [np.nan, 2.0],
+            [3.0, 4.0],
+            [np.nan, np.nan],
+        ],
+    )
+
+
+def _make_signal_data():
+    rng = np.random.default_rng(31)
+    t = np.linspace(0, 1, 256, endpoint=False)
+    X = rng.normal(scale=0.1, size=(6, 2, 256))
+    X[:, 0, :] += np.sin(2 * np.pi * 10 * t)
+    X[:, 1, :] += np.sin(2 * np.pi * 6 * t)
+    return X
+
+
+def _descriptor_result_container(result):
+    return DataContainer(
+        X=result["X"],
+        dims=("obs", "feature"),
+        coords={"feature": result["descriptor_names"]},
+    )
+
+
+def test_aggregate_multiple_stats_insert_stat_dimension_in_requested_order():
+    agg = _make_grouped_descriptor_container().aggregate(
+        by=["g1", "g1", "g2", "g2"],
+        stats=["mean", "std"],
+    )
+
+    assert agg.dims == ("obs", "stat", "feature")
+    assert agg.coords["stat"].tolist() == ["mean", "std"]
+    assert list(agg.coords["feature"]) == ["alpha_ch-all", "beta_ch-all"]
+    assert agg.X.shape == (2, 2, 2)
+
+
+def test_aggregate_group_ids_follow_first_appearance_order():
+    agg = _make_descriptor_container(
+        [[1.0], [2.0], [3.0], [4.0]],
+        descriptor_names=["alpha_ch-all"],
+    ).aggregate(by=["g2", "g1", "g2", "g3"])
+
+    assert agg.coords["obs"].tolist() == ["g2", "g1", "g3"]
+    assert agg.ids.tolist() == ["g2", "g1", "g3"]
+
+
+def test_aggregate_count_sem_and_epoch_count_match_expected_values():
+    count_agg = _make_grouped_descriptor_container().aggregate(
+        by=["g1", "g1", "g2", "g2"],
+        stats="count",
+    )
+    sem_agg = _make_grouped_descriptor_container().aggregate(
+        by=["g1", "g1", "g2", "g2"],
+        stats="sem",
+    )
+
+    assert count_agg.X[0].tolist() == [0.0, 2.0]
+    assert count_agg.coords["epoch_count"].tolist() == [2, 2]
+    expected_sem = np.nanstd([1.0, 2.0]) / np.sqrt(2)
+    assert np.isclose(sem_agg.X[0, 1], expected_sem)
+
+
+def test_aggregate_min_count_collect_policy_records_failure():
+    agg = _make_grouped_descriptor_container().aggregate(
+        by=["g1", "g1", "g2", "g2"],
+        min_count=2,
+        on_insufficient="collect",
+    )
+
+    assert len(agg.meta["aggregate_failures"]) == 1
+    assert agg.meta["aggregate_failures"][0]["exception_type"] == (
+        "InsufficientObservations"
+    )
+    assert agg.meta["aggregate_failures"][0]["valid_row_count"] == 1
+    assert agg.meta["aggregate_failures"][0]["row_count"] == 2
+    assert np.isnan(agg.X[1]).all()
+
+
+def test_aggregate_min_count_warn_policy_emits_warning():
+    with pytest.warns(UserWarning, match="requires at least 2"):
+        agg = _make_grouped_descriptor_container().aggregate(
+            by=["g1", "g1", "g2", "g2"],
+            min_count=2,
+            on_insufficient="warn",
+        )
+
+    assert np.isnan(agg.X[1]).all()
+    assert agg.meta["aggregate_failures"][0]["exception_type"] == (
+        "InsufficientObservations"
+    )
+
+
+def test_aggregate_descriptor_pipeline_output_can_be_grouped():
+    X = _make_signal_data()
+    result = DescriptorPipeline(
+        {
+            "output": {"channel_pooling": "all"},
+            "families": {"bands": {"enabled": True, "outputs": ["absolute_power"]}},
+        }
+    ).extract(X=X, sfreq=256.0, channel_names=["Fz", "Cz"])
+    agg = _descriptor_result_container(result).aggregate(
+        by=["s1", "s1", "s1", "s2", "s2", "s2"],
+        stats="mean",
+    )
+
+    assert all("_global" not in name for name in result["descriptor_names"])
+    assert any(name.endswith("_ch-all") for name in result["descriptor_names"])
+    assert agg.X.shape == (2, result["X"].shape[1])
+    assert agg.dims == ("obs", "feature")
+
+
+def test_aggregate_descriptor_pipeline_preserves_channel_group_tokens():
+    X = _make_signal_data()
+    result = DescriptorPipeline(
+        {
+            "output": {"channel_pooling": {"Frontal": ["Fz", "Cz"]}},
+            "families": {"bands": {"enabled": True, "outputs": ["absolute_power"]}},
+        }
+    ).extract(X=X, sfreq=256.0, channel_names=["Fz", "Cz"])
+    agg = _descriptor_result_container(result).aggregate(
+        by=["s1", "s1", "s1", "s2", "s2", "s2"],
+        stats=["mean", "std"],
+    )
+
+    assert any(name.endswith("_chgrp-Frontal") for name in result["descriptor_names"])
+    assert agg.dims == ("obs", "stat", "feature")
+    assert agg.coords["stat"].tolist() == ["mean", "std"]
 
 
 def test_unstack_basic():
@@ -432,3 +577,245 @@ def test_unstack_error_dim_not_found():
     container = DataContainer(X=X, dims=("a", "b"))
     with pytest.raises(ValueError, match="Dimension 'c' not found"):
         container.unstack("c")
+
+
+def test_aggregate_validation_errors(sample_container):
+    """Test validation of min_count, on_insufficient, and empty stats."""
+    with pytest.raises(ValueError, match="`min_count` must be at least 1"):
+        sample_container.aggregate(by="group", min_count=0)
+    with pytest.raises(ValueError, match="`on_insufficient` must be one of"):
+        sample_container.aggregate(by="group", on_insufficient="invalid")
+    with pytest.raises(ValueError, match="`stats` must not be empty"):
+        sample_container.aggregate(by="group", stats=[])
+
+
+def test_aggregate_by_y(sample_container):
+    """Verify grouping using the target vector 'y'."""
+    # sample_container.y is [0, 1]
+    agg = sample_container.aggregate(by="y", stats="mean")
+    assert agg.shape[0] == 2
+    assert np.array_equal(agg.coords["obs"], [0, 1])
+
+
+def test_aggregate_obs_idx_not_zero():
+    """Verify aggregation when 'obs' is not at the first axis."""
+    X = np.zeros((3, 5, 10))
+    # obs at index 1
+    dc = DataContainer(X, dims=("channel", "obs", "time"))
+    # 5 observations grouped into 3: [G0, G0, G1, G1, G2]
+    agg = dc.aggregate(by=[0, 0, 1, 1, 2], stats="mean")
+    assert agg.dims == ("channel", "obs", "time")
+    assert agg.X.shape == (3, 3, 10)
+
+
+def test_aggregate_all_stats(sample_container):
+    """Verify all supported statistical measures and aliases."""
+    # Using legacy aliases to ensure normalization
+    stats = [
+        "obs-mean",
+        "median",
+        "std",
+        "var",
+        "sem",
+        "min",
+        "max",
+        "first",
+        "count",
+    ]
+    # Reduce all observations to 1 group
+    agg = sample_container.aggregate(by=[0, 0], stats=stats)
+    assert agg.dims == ("obs", "stat", "channel", "time")
+    assert agg.coords["stat"].tolist() == [
+        "mean",
+        "median",
+        "std",
+        "var",
+        "sem",
+        "min",
+        "max",
+        "first",
+        "count",
+    ]
+
+
+def test_aggregate_1d_data():
+    """Test aggregation of 1D data (only obs dimension)."""
+    X = np.array([1.0, 2.0, 3.0, 4.0])
+    dc = DataContainer(X, dims=("obs",))
+    agg = dc.aggregate(by=["A", "A", "B", "B"], stats="mean")
+    assert agg.dims == ("obs",)
+    assert agg.X.shape == (2,)
+    assert np.allclose(agg.X, [1.5, 3.5])
+
+
+def test_aggregate_insufficient_policy_raise():
+    """Verify 'raise' policy for insufficient observations."""
+    X = np.ones((1, 1))
+    dc = DataContainer(X, dims=("obs", "f"))
+    with pytest.raises(ValueError, match="has 1 valid rows, requires at least 2"):
+        dc.aggregate(by=["G"], min_count=2, on_insufficient="raise")
+
+
+def test_aggregate_y_inconsistency():
+    """Verify 'y' is dropped if it varies within a group."""
+    X = np.ones((2, 1))
+    y = np.array([0, 1])
+    dc = DataContainer(X, dims=("obs", "f"), y=y)
+    # Group [0, 1] has inconsistent y
+    agg = dc.aggregate(by=["Group", "Group"])
+    assert agg.y is None
+
+
+def test_normalization_inplace(sample_container):
+    """Verify in-place variants for center, zscore, and rms_scale."""
+    # sample_container uses int X, must cast to float for subtract/div
+    sample_container.X = sample_container.X.astype(float)
+
+    # center
+    dc_c = sample_container.center(dim="time")
+    assert not np.array_equal(dc_c.X, sample_container.X)
+
+    import copy
+
+    dc_c_in = copy.deepcopy(sample_container)
+    dc_c_in.center(dim="time", inplace=True)
+    assert np.allclose(np.nanmean(dc_c_in.X, axis=2), 0)
+
+    # zscore
+    dc_z_in = copy.deepcopy(sample_container)
+    dc_z_in.zscore(dim="time", inplace=True)
+    assert np.allclose(np.nanstd(dc_z_in.X, axis=2), 1)
+
+    # rms_scale
+    dc_rms_in = copy.deepcopy(sample_container)
+    dc_rms_in.rms_scale(dim="time", inplace=True)
+    # RMS should be 1
+    rms = np.sqrt(np.mean(dc_rms_in.X**2, axis=2))
+    assert np.allclose(rms, 1)
+
+
+def test_isel_edge_cases(sample_container, caplog):
+    """Cover untested lines in isel (warnings and errors)."""
+    # 1. Unknown dim warning
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        subset = sample_container.isel(unknown=[0])
+    assert "Dimension unknown not in" in caplog.text
+    assert subset.shape == sample_container.shape
+
+    # 2. Slicing failure (e.g. out of bounds)
+    with pytest.raises(IndexError):
+        sample_container.isel(obs=[10])
+
+
+def test_balance_complex_edge_cases(data_container_cls):
+    """Cover untested lines in balance (strata fallback and cleaning)."""
+    # 1. Target not found
+    X = np.zeros((2, 1))
+    dc = data_container_cls(X, dims=("obs", "f"))
+    with pytest.raises(ValueError, match="Target 'missing' not found"):
+        dc.balance(target="missing")
+
+    # 2. Covariate not found
+    y = np.array([0, 1])
+    dc2 = data_container_cls(X, dims=("obs", "f"), y=y)
+    with pytest.raises(ValueError, match="Covariate 'missing' not found"):
+        dc2.balance(covariates=["missing"], target="y")
+
+    # 3. Single-class stratum in oversample (fallback path)
+    y3 = np.array([0, 0, 1])
+    s3 = np.array(["A", "A", "B"])
+    dc3 = data_container_cls(
+        X=np.zeros((3, 1)), dims=("obs", "f"), y=y3, coords={"s": s3}
+    )
+    # Group 'B' has only class 1. Undersample would fail, so we oversample.
+    balanced = dc3.balance(target="y", covariates=["s"], strategy="oversample")
+    assert balanced.shape[0] > 0
+
+
+def test_select_conflicting_selections(sample_container):
+    """Verify that conflicting selections on same axis raise ValueError."""
+    # time=1 AND time=2 -> empty set
+    with pytest.raises(ValueError, match="resulted in empty set"):
+        sample_container.select(time=1).select(time=2)
+
+
+def test_select_aux_coord_no_match(data_container_cls, caplog):
+    """Test selection on auxiliary coordinate that matches no dimension."""
+    X = np.zeros((5, 10))
+    # Aux coord with len 7 (matches neither 5 nor 10)
+    coords = {"aux": np.arange(7)}
+    dc = data_container_cls(X, dims=("obs", "feat"), coords=coords)
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        subset = dc.select(aux=1)
+    assert "matches no dimension" in caplog.text
+    assert subset.shape == (5, 10)
+
+
+def test_select_fuzzy_no_match(sample_container, caplog):
+    """Verify warning when fuzzy matching fails to find candidates."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        # xyz is very far from Fz, Cz, Pz.
+        with pytest.raises(ValueError, match="resulted in empty set"):
+            sample_container.select(channel=["xyz"], fuzzy=True)
+
+    assert "No fuzzy match found" in caplog.text
+
+
+def test_select_no_coords(data_container_cls, caplog):
+    """Test selection on a dimension that has no defined coordinates."""
+    X = np.zeros((2, 2))
+    dc = data_container_cls(X, dims=("obs", "feat"), coords={})
+
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        subset = dc.select(feat=[0])
+    assert "is empty" in caplog.text.lower()
+    assert subset.shape == (2, 2)
+
+
+def test_select_conflicting_axes(sample_container):
+    """Verify intersection logic for multiple selections on the same axis (y + obs)."""
+    # y=0 matches obs index 0. ids='s1' matches obs index 1. Intersection is empty.
+    with pytest.raises(ValueError, match="Conflicting selections"):
+        sample_container.select(y=[0], ids=["s1"])
+
+
+def test_unstack_shape_mismatch(sample_container):
+    """Verify error when unstacking with corrupted shape metadata."""
+    stacked = sample_container.stack(dims=("obs", "time"), new_dim="obs")
+    # Manually corrupt shapes metadata: 10*10 = 100, but actual obs length is 8 (2*4)
+    stacked.meta["stacked_shapes"] = (10, 10)
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        stacked.unstack("obs")
+
+
+def test_normalization_invalid_dims(sample_container):
+    """Verify errors for invalid dimensions in zscore and rms_scale."""
+    with pytest.raises(ValueError, match="not found"):
+        sample_container.zscore(dim="invalid")
+    with pytest.raises(ValueError, match="not found"):
+        sample_container.rms_scale(dim="invalid")
+
+
+def test_baseline_correction_alias(sample_container):
+    """Verify that baseline_correction is a functional alias for center."""
+    sample_container.X = sample_container.X.astype(float)
+    dc = sample_container.baseline_correction(dim="time")
+    assert np.allclose(np.nanmean(dc.X, axis=2), 0)
+
+
+def test_aggregate_empty_feature_dim():
+    """Verify valid_row_count calculation for data with no features."""
+    X = np.zeros((2, 0))
+    dc = DataContainer(X, dims=("obs", "feature"))
+    # Should not raise even if min_count=1 because valid_row_count will match row_count
+    agg = dc.aggregate(by=["A", "B"], min_count=1)
+    assert agg.shape == (2, 0)

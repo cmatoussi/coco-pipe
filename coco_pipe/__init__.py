@@ -2,6 +2,10 @@
 Package initializer for the coco_pipe package.
 """
 
+from .descriptors import (
+    DescriptorConfig,
+    DescriptorPipeline,
+)
 from .dim_reduction import (
     METHODS,
     BaseReducer,
@@ -22,6 +26,8 @@ from .dim_reduction import (
 
 # Core exports
 __all__ = [
+    "DescriptorConfig",
+    "DescriptorPipeline",
     "DimReduction",
     "METHODS",
     "interpret_features",
