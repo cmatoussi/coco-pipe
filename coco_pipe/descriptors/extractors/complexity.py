@@ -13,8 +13,13 @@ supports them. In the current implementation:
 
 - `spectral_entropy`, `hjorth_mobility`, and `hjorth_complexity` use batched
   `antropy` calls over flattened observation-channel units
-- `sample_entropy`, `perm_entropy`, and `lziv_complexity` are still evaluated
-  one 1D signal at a time
+- `sample_entropy`, `perm_entropy`, `approx_entropy`, `svd_entropy`,
+  `petrosian_fd`, `katz_fd`, `higuchi_fd`, and `lziv_complexity` are still
+  evaluated one 1D signal at a time
+- `shannon_entropy`, `fuzzy_entropy`, `dispersion_entropy`, and
+  `hurst_exponent` use scalar `neurokit2` calls
+- `zero_crossings`, `kurtosis`, and `rms` are computed as simple scalar
+  channelwise signal descriptors
 
 Author: Hamza Abdelhedi (hamza.abdelhedi@umontreal.ca)
 """
@@ -24,10 +29,49 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from scipy.stats import kurtosis as scipy_kurtosis
 
 from ...utils import import_optional_dependency
 from ..configs import ComplexityDescriptorConfig
 from .base import BaseDescriptorExtractor, _DescriptorBlock, make_failure_record
+
+_ANTROPY_BATCHED_MEASURES = frozenset(
+    {"spectral_entropy", "hjorth_mobility", "hjorth_complexity"}
+)
+_ANTROPY_SCALAR_MEASURES = frozenset(
+    {
+        "sample_entropy",
+        "perm_entropy",
+        "approx_entropy",
+        "svd_entropy",
+        "petrosian_fd",
+        "katz_fd",
+        "higuchi_fd",
+        "lziv_complexity",
+    }
+)
+_NEUROKIT_SCALAR_MEASURES = frozenset(
+    {
+        "sample_entropy",
+        "perm_entropy",
+        "spectral_entropy",
+        "shannon_entropy",
+        "fuzzy_entropy",
+        "dispersion_entropy",
+        "hurst_exponent",
+    }
+)
+_CUSTOM_SCALAR_MEASURES = frozenset({"zero_crossings", "kurtosis", "rms"})
+
+
+def _normalize_scalar_output(value: Any) -> float:
+    """Normalize backend scalar outputs to one plain float."""
+    if isinstance(value, tuple):
+        value = value[0]
+    array = np.asarray(value, dtype=float)
+    if array.size != 1:
+        raise ValueError("Complexity backend returned a non-scalar result.")
+    return float(array.reshape(-1)[0])
 
 
 class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
@@ -58,9 +102,12 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
     deterministic sensor-level naming is applied afterward through
     :meth:`BaseDescriptorExtractor._finalize_descriptor`.
 
-    When `antropy` is selected, the extractor uses batched calls where the
-    backend supports them and falls back to scalar loops for measures that are
-    inherently one-signal-at-a-time in the current backend API.
+    When `backend="auto"` is selected, the extractor resolves each measure to
+    the preferred available implementation:
+
+    - `antropy` for the existing antropy-backed measures
+    - `neurokit2` for measures that are only supported there
+    - built-in NumPy/SciPy implementations for simple scalar signal summaries
     """
 
     family_name = "complexity"
@@ -181,8 +228,9 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
 
         - batched `antropy` calls for `spectral_entropy`,
           `hjorth_mobility`, and `hjorth_complexity`
-        - scalar calls for `sample_entropy`, `perm_entropy`, and
-          `lziv_complexity`
+        - scalar `antropy` calls for the remaining antropy-backed measures
+        - scalar `neurokit2` calls for `shannon_entropy`, `fuzzy_entropy`,
+          `dispersion_entropy`, and `hurst_exponent`
 
         Non-finite outputs are converted to `NaN` and recorded under
         ``failures`` unless `runtime.on_error == "raise"`, in which case the
@@ -210,11 +258,64 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
         flat_signals = X.reshape(-1, X.shape[-1])
         batched_outputs: dict[str, np.ndarray] = {}
         scalar_dispatch: dict[str, Any] = {}
+        measure_backends: dict[str, str] = {}
+        custom_scalar_dispatch = {
+            "zero_crossings": lambda signal, kwargs, sfreq: float(
+                np.count_nonzero(np.diff(np.signbit(np.asarray(signal, dtype=float))))
+            ),
+            "kurtosis": lambda signal, kwargs, sfreq: float(
+                scipy_kurtosis(
+                    np.asarray(signal, dtype=float),
+                    fisher=kwargs.get("fisher", True),
+                    bias=kwargs.get("bias", False),
+                )
+            ),
+            "rms": lambda signal, kwargs, sfreq: float(
+                np.sqrt(np.mean(np.square(np.asarray(signal, dtype=float))))
+            ),
+        }
 
-        if self.config.backend in {"antropy", "auto"}:
+        unsupported: list[str] = []
+        for measure in self.config.measures:
+            if measure in _CUSTOM_SCALAR_MEASURES:
+                measure_backends[measure] = "custom"
+                continue
+            if self.config.backend == "antropy":
+                if (
+                    measure in _ANTROPY_BATCHED_MEASURES
+                    or measure in _ANTROPY_SCALAR_MEASURES
+                ):
+                    measure_backends[measure] = "antropy"
+                else:
+                    unsupported.append(measure)
+                continue
+            if self.config.backend == "neurokit2":
+                if measure in _NEUROKIT_SCALAR_MEASURES:
+                    measure_backends[measure] = "neurokit2"
+                else:
+                    unsupported.append(measure)
+                continue
+            if (
+                measure in _ANTROPY_BATCHED_MEASURES
+                or measure in _ANTROPY_SCALAR_MEASURES
+            ):
+                measure_backends[measure] = "antropy"
+            elif measure in _NEUROKIT_SCALAR_MEASURES:
+                measure_backends[measure] = "neurokit2"
+            else:
+                unsupported.append(measure)
+
+        if unsupported:
+            raise ValueError(
+                f"Measures {sorted(unsupported)} are not supported by backend "
+                f"'{self.config.backend}'."
+            )
+
+        ant = None
+        if "antropy" in measure_backends.values():
             ant = self._load_antropy()
 
-            if "spectral_entropy" in self.config.measures:
+            if measure_backends.get("spectral_entropy") == "antropy":
                 batched_outputs["spectral_entropy"] = np.asarray(
                     ant.spectral_entropy(
                         flat_signals,
@@ -226,55 +327,98 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
                 )
 
             if (
-                "hjorth_mobility" in self.config.measures
-                or "hjorth_complexity" in self.config.measures
+                measure_backends.get("hjorth_mobility") == "antropy"
+                or measure_backends.get("hjorth_complexity") == "antropy"
             ):
                 mobility, complexity = ant.hjorth_params(
                     flat_signals,
                     axis=-1,
                 )
-                if "hjorth_mobility" in self.config.measures:
+                if measure_backends.get("hjorth_mobility") == "antropy":
                     batched_outputs["hjorth_mobility"] = np.asarray(
                         mobility,
                         dtype=float,
                     )
-                if "hjorth_complexity" in self.config.measures:
+                if measure_backends.get("hjorth_complexity") == "antropy":
                     batched_outputs["hjorth_complexity"] = np.asarray(
                         complexity,
                         dtype=float,
                     )
 
-            scalar_dispatch = {
-                "sample_entropy": lambda signal, kwargs, sfreq: float(
-                    ant.sample_entropy(signal, **kwargs)
+            antropy_scalar_dispatch = {
+                "sample_entropy": lambda signal, kwargs, sfreq: (
+                    _normalize_scalar_output(ant.sample_entropy(signal, **kwargs))
                 ),
-                "perm_entropy": lambda signal, kwargs, sfreq: float(
+                "perm_entropy": lambda signal, kwargs, sfreq: _normalize_scalar_output(
                     ant.perm_entropy(signal, **kwargs)
                 ),
-                "lziv_complexity": lambda signal, kwargs, sfreq: float(
-                    ant.lziv_complexity(
-                        (signal > np.median(signal)).astype(int),
-                        **kwargs,
+                "approx_entropy": lambda signal, kwargs, sfreq: (
+                    _normalize_scalar_output(ant.app_entropy(signal, **kwargs))
+                ),
+                "svd_entropy": lambda signal, kwargs, sfreq: _normalize_scalar_output(
+                    ant.svd_entropy(signal, **kwargs)
+                ),
+                "petrosian_fd": lambda signal, kwargs, sfreq: _normalize_scalar_output(
+                    ant.petrosian_fd(signal, **kwargs)
+                ),
+                "katz_fd": lambda signal, kwargs, sfreq: _normalize_scalar_output(
+                    ant.katz_fd(signal, **kwargs)
+                ),
+                "higuchi_fd": lambda signal, kwargs, sfreq: _normalize_scalar_output(
+                    ant.higuchi_fd(signal, **kwargs)
+                ),
+                "lziv_complexity": lambda signal, kwargs, sfreq: (
+                    _normalize_scalar_output(
+                        ant.lziv_complexity(
+                            (signal > np.median(signal)).astype(int),
+                            **kwargs,
+                        )
                     )
                 ),
             }
-        else:
+            for measure, func in antropy_scalar_dispatch.items():
+                if measure_backends.get(measure) == "antropy":
+                    scalar_dispatch[measure] = func
+
+        nk = None
+        if "neurokit2" in measure_backends.values():
             nk = self._load_neurokit()
-            scalar_dispatch = {
-                "sample_entropy": lambda signal, kwargs, sfreq: float(
-                    nk.entropy_sample(signal, **kwargs)[0]
+            neurokit_scalar_dispatch = {
+                "sample_entropy": lambda signal, kwargs, sfreq: (
+                    _normalize_scalar_output(nk.entropy_sample(signal, **kwargs))
                 ),
-                "perm_entropy": lambda signal, kwargs, sfreq: float(
-                    nk.entropy_permutation(signal, **kwargs)[0]
+                "perm_entropy": lambda signal, kwargs, sfreq: _normalize_scalar_output(
+                    nk.entropy_permutation(signal, **kwargs)
                 ),
-                "spectral_entropy": lambda signal, kwargs, sfreq: float(
-                    nk.entropy_spectral(
-                        signal,
-                        sampling_rate=sfreq,
-                        **kwargs,
-                    )[0]
+                "spectral_entropy": lambda signal, kwargs, sfreq: (
+                    _normalize_scalar_output(
+                        nk.entropy_spectral(
+                            signal,
+                            sampling_rate=sfreq,
+                            **kwargs,
+                        )
+                    )
+                ),
+                "shannon_entropy": lambda signal, kwargs, sfreq: (
+                    _normalize_scalar_output(nk.entropy_shannon(signal, **kwargs))
+                ),
+                "fuzzy_entropy": lambda signal, kwargs, sfreq: _normalize_scalar_output(
+                    nk.entropy_fuzzy(signal, **kwargs)
+                ),
+                "dispersion_entropy": lambda signal, kwargs, sfreq: (
+                    _normalize_scalar_output(nk.entropy_dispersion(signal, **kwargs))
+                ),
+                "hurst_exponent": lambda signal, kwargs, sfreq: (
+                    _normalize_scalar_output(nk.fractal_hurst(signal, **kwargs))
                 ),
             }
+            for measure, func in neurokit_scalar_dispatch.items():
+                if measure_backends.get(measure) == "neurokit2":
+                    scalar_dispatch[measure] = func
+
+        for measure, func in custom_scalar_dispatch.items():
+            if measure_backends.get(measure) == "custom":
+                scalar_dispatch[measure] = func
 
         for measure, flat_values in batched_outputs.items():
             values = np.asarray(flat_values, dtype=float).reshape(
@@ -308,12 +452,6 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
             for measure in self.config.measures
             if measure not in batched_outputs
         ]
-        unsupported = sorted(set(scalar_measures) - set(scalar_dispatch))
-        if unsupported:
-            raise ValueError(
-                f"Measures {unsupported} are not supported by backend "
-                f"'{self.config.backend}'."
-            )
 
         for obs_rel in range(X.shape[0]):
             unit_signals = X[obs_rel]
@@ -389,6 +527,7 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
                 "backend": self.config.backend,
                 "measures": list(self.config.measures),
                 "batched_measures": sorted(batched_outputs),
+                "measure_backends": dict(measure_backends),
             },
             failures=failures,
         )

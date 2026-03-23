@@ -23,6 +23,8 @@ import numpy as np
 from ...utils import import_optional_dependency
 from ..configs import ParametricDescriptorConfig
 
+_ALPHA_BAND = (8.0, 13.0)
+
 
 @dataclass(slots=True)
 class _ParametricFitBatch:
@@ -124,12 +126,41 @@ def fit_single_spectrum(
         peak_count = 0.0
         dominant_freq = np.nan
         dominant_power = np.nan
+        dominant_bandwidth = np.nan
+        alpha_peak_freq = np.nan
+        alpha_peak_power = np.nan
     else:
         periodic = np.atleast_2d(periodic)
         peak_count = float(periodic.shape[0])
-        dominant_idx = int(np.nanargmax(periodic[:, 1]))
-        dominant_freq = float(periodic[dominant_idx, 0])
-        dominant_power = float(periodic[dominant_idx, 1])
+        power = np.asarray(periodic[:, 1], dtype=float)
+        valid_power = np.isfinite(power)
+        if np.any(valid_power):
+            valid_indices = np.flatnonzero(valid_power)
+            dominant_idx = int(valid_indices[np.nanargmax(power[valid_power])])
+            dominant_freq = float(periodic[dominant_idx, 0])
+            dominant_power = float(periodic[dominant_idx, 1])
+            dominant_bandwidth = (
+                float(periodic[dominant_idx, 2]) if periodic.shape[1] >= 3 else np.nan
+            )
+        else:
+            dominant_freq = np.nan
+            dominant_power = np.nan
+            dominant_bandwidth = np.nan
+
+        alpha_mask = (
+            valid_power
+            & np.isfinite(periodic[:, 0])
+            & (periodic[:, 0] >= _ALPHA_BAND[0])
+            & (periodic[:, 0] <= _ALPHA_BAND[1])
+        )
+        if np.any(alpha_mask):
+            alpha_indices = np.flatnonzero(alpha_mask)
+            alpha_idx = int(alpha_indices[np.nanargmax(power[alpha_mask])])
+            alpha_peak_freq = float(periodic[alpha_idx, 0])
+            alpha_peak_power = float(periodic[alpha_idx, 1])
+        else:
+            alpha_peak_freq = np.nan
+            alpha_peak_power = np.nan
 
     offset = float(aperiodic[0]) if aperiodic.size >= 1 else np.nan
     knee = float(aperiodic[1]) if aperiodic.size == 3 else np.nan
@@ -161,6 +192,9 @@ def fit_single_spectrum(
         "peak_count": peak_count,
         "peak_freq_dom": dominant_freq,
         "peak_power_dom": dominant_power,
+        "peak_bandwidth_dom": dominant_bandwidth,
+        "alpha_peak_freq": alpha_peak_freq,
+        "alpha_peak_power": alpha_peak_power,
     }, periodic_psd
 
 
@@ -211,7 +245,16 @@ def fit_parametric_batch(
         if "fit_quality" in config.outputs:
             metric_names.extend(["fit_error", "r_squared"])
         if "peak_summary" in config.outputs:
-            metric_names.extend(["peak_count", "peak_freq_dom", "peak_power_dom"])
+            metric_names.extend(
+                [
+                    "peak_count",
+                    "peak_freq_dom",
+                    "peak_power_dom",
+                    "peak_bandwidth_dom",
+                    "alpha_peak_freq",
+                    "alpha_peak_power",
+                ]
+            )
     metric_arrays = {
         metric_name: np.full(
             (local_psds.shape[0], local_psds.shape[1]),

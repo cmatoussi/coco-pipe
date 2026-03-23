@@ -274,6 +274,41 @@ def test_complexity_validation_edge_cases():
         DescriptorConfig(families={"complexity": {"measures": ["non_existent"]}})
 
 
+def test_new_complexity_measures_are_accepted():
+    measures = [
+        "approx_entropy",
+        "svd_entropy",
+        "petrosian_fd",
+        "katz_fd",
+        "higuchi_fd",
+        "shannon_entropy",
+        "fuzzy_entropy",
+        "dispersion_entropy",
+        "hurst_exponent",
+        "zero_crossings",
+        "kurtosis",
+        "rms",
+    ]
+    config = DescriptorConfig.model_validate(
+        {"families": {"complexity": {"enabled": True, "measures": measures}}}
+    )
+    assert config.families.complexity.measures == measures
+
+
+def test_unknown_complexity_measure_is_rejected():
+    with pytest.raises(ValidationError, match="Unknown complexity measures"):
+        DescriptorConfig.model_validate(
+            {
+                "families": {
+                    "complexity": {
+                        "enabled": True,
+                        "measures": ["approx_entropy", "non_existent"],
+                    }
+                }
+            }
+        )
+
+
 def test_channel_pooling_validation_edge_cases():
     with pytest.raises(ValidationError):
         DescriptorConfig(output={"channel_pooling": "some_string"})

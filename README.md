@@ -193,6 +193,13 @@ Contributions are welcome! If you have suggestions or find any bugs, please open
 - Plan and implement enhancements for visualization features.
 - Integrate new visual components and testing.
 
+#### Descriptors Module
+- Add a future connectivity descriptor family built on `mne-connectivity`.
+- Start that connectivity family with phase-based measures such as `PLV`, with room for later extensions like `ciPLV`, `PLI`, and `wPLI`.
+- Add a future wavelet-based descriptor batch built on `PyWavelets`.
+- Start that wavelet batch with `sure_entropy`.
+- Keep `log_energy_entropy` on the roadmap, but finalize its scientific definition before implementation.
+
 #### Dim reduction:
 - Add parallelism
 

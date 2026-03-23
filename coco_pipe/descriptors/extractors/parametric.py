@@ -164,7 +164,16 @@ class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
         if "fit_quality" in self.config.outputs:
             metrics.extend(["fit_error", "r_squared"])
         if "peak_summary" in self.config.outputs:
-            metrics.extend(["peak_count", "peak_freq_dom", "peak_power_dom"])
+            metrics.extend(
+                [
+                    "peak_count",
+                    "peak_freq_dom",
+                    "peak_power_dom",
+                    "peak_bandwidth_dom",
+                    "alpha_peak_freq",
+                    "alpha_peak_power",
+                ]
+            )
         failures: list[dict[str, Any]] = []
         for obs_rel, unit_idx, exception_type, message in fit_batch.errors:
             if runtime.on_error == "raise":
