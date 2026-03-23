@@ -228,6 +228,64 @@ def test_repr():
     assert "obs=5" in r
 
 
+def test_obs_table_exports_only_obs_aligned_vectors(sample_container):
+    sample_container.coords["bad_matrix"] = np.array([[1, 2], [3, 4]])
+
+    metadata = sample_container.obs_table(
+        include_ids=True, include_y=True, y_col="target"
+    )
+
+    assert metadata.columns.tolist() == [
+        "obs_id",
+        "Study ID",
+        "group",
+        "target",
+    ]
+    assert metadata["obs_id"].tolist() == ["s0", "s1"]
+    assert metadata["Study ID"].tolist() == ["S0", "S1"]
+    assert metadata["group"].tolist() == ["control", "patient"]
+    assert metadata["target"].tolist() == [0, 1]
+
+
+def test_obs_table_requires_ids_when_requested(sample_container):
+    sample_container.ids = None
+
+    with pytest.raises(ValueError, match="include_ids=True"):
+        sample_container.obs_table(include_ids=True)
+
+
+def test_obs_table_validation_errors(sample_container):
+    """Test alignment and dimensionality validation in obs_table."""
+    # 1. No obs dimension
+    X = np.zeros((10, 10))
+    dc_no_obs = DataContainer(X, dims=("a", "b"))
+    with pytest.raises(ValueError, match="requires an 'obs' dimension"):
+        dc_no_obs.obs_table()
+
+    # 2. Corrupted ids (2D)
+    sample_container.ids = np.zeros((2, 2))
+    with pytest.raises(ValueError, match="must be 1D and aligned"):
+        sample_container.obs_table(include_ids=True)
+
+    # 3. Corrupted y (aligned but 2D)
+    sample_container.ids = ["s0", "s1"]
+    sample_container.y = np.zeros((2, 2))
+    with pytest.raises(ValueError, match="must be 1D and aligned"):
+        sample_container.obs_table(include_y=True)
+
+
+def test_obs_table_include_obs_coord(sample_container):
+    """Verify include_obs_coord parameter."""
+    sample_container.coords["obs"] = ["O1", "O2"]
+    table = sample_container.obs_table(include_obs_coord=True)
+    assert "obs" in table.columns
+    assert table["obs"].tolist() == ["O1", "O2"]
+
+    # Also check coordinate loop skip logic for 'obs'
+    table2 = sample_container.obs_table(include_obs_coord=False)
+    assert "obs" not in table2.columns
+
+
 def test_save_load_errors(tmp_path):
     """Test save/load failure modes."""
     DataContainer(np.zeros((2, 2)), dims=("a", "b"))
@@ -433,6 +491,207 @@ def test_aggregate_count_sem_and_epoch_count_match_expected_values():
     assert np.isclose(sem_agg.X[0, 1], expected_sem)
 
 
+def test_aggregate_mad_and_iqr_ignore_nans_per_feature():
+    agg = _make_grouped_descriptor_container().aggregate(
+        by=["g1", "g1", "g2", "g2"],
+        stats=["mad", "iqr"],
+    )
+
+    assert agg.dims == ("obs", "stat", "feature")
+    assert agg.coords["stat"].tolist() == ["mad", "iqr"]
+    assert np.isnan(agg.X[0, 0, 0])
+    assert np.isnan(agg.X[0, 1, 0])
+    assert np.isclose(agg.X[0, 0, 1], 0.5)
+    assert np.isclose(agg.X[0, 1, 1], 0.5)
+    assert np.isclose(agg.X[1, 0, 0], 0.0)
+    assert np.isclose(agg.X[1, 1, 0], 0.0)
+    assert np.isclose(agg.X[1, 0, 1], 0.0)
+    assert np.isclose(agg.X[1, 1, 1], 0.0)
+
+
+def test_aggregate_groups_applies_selected_stats_in_requested_order():
+    container = _make_descriptor_container(
+        [
+            [1.0, 10.0, 100.0, 1000.0],
+            [3.0, 14.0, 120.0, 1100.0],
+            [5.0, 18.0, 130.0, 1300.0],
+            [7.0, 22.0, 150.0, 1500.0],
+        ],
+        descriptor_names=[
+            "band_abs_alpha_ch-all",
+            "band_log_abs_alpha_ch-all",
+            "complexity_entropy_ch-all",
+            "param_offset_ch-all",
+        ],
+    )
+
+    agg = container.aggregate_groups(
+        by=["s1", "s1", "s2", "s2"],
+        groups=[
+            {
+                "stats": "mean",
+                "exclude_prefixes": ["band_abs_"],
+            },
+            {
+                "prefixes": ["band_log_abs_"],
+                "stats": ["median", "iqr"],
+            },
+            {
+                "prefixes": ["complexity_"],
+                "stats": ["median", "mad"],
+            },
+            {
+                "prefixes": ["param_"],
+                "stats": ["median", "iqr"],
+            },
+        ],
+    )
+
+    assert agg.dims == ("obs", "feature")
+    assert agg.coords["obs"].tolist() == ["s1", "s2"]
+    assert agg.ids.tolist() == ["s1", "s2"]
+    assert agg.coords["feature"].tolist() == [
+        "mean_band_log_abs_alpha_ch-all",
+        "mean_complexity_entropy_ch-all",
+        "mean_param_offset_ch-all",
+        "median_band_log_abs_alpha_ch-all",
+        "iqr_band_log_abs_alpha_ch-all",
+        "median_complexity_entropy_ch-all",
+        "mad_complexity_entropy_ch-all",
+        "median_param_offset_ch-all",
+        "iqr_param_offset_ch-all",
+    ]
+    assert "mean_band_abs_alpha_ch-all" not in agg.coords["feature"].tolist()
+    assert np.allclose(
+        agg.X[0],
+        [12.0, 110.0, 1050.0, 12.0, 2.0, 110.0, 10.0, 1050.0, 50.0],
+    )
+    assert np.allclose(
+        agg.X[1],
+        [20.0, 140.0, 1400.0, 20.0, 2.0, 140.0, 10.0, 1400.0, 100.0],
+    )
+    assert agg.meta["agg_stats"] == ["mean", "median", "iqr", "mad"]
+
+
+def test_aggregate_groups_rejects_duplicate_output_feature_names():
+    container = _make_descriptor_container(
+        [[1.0], [2.0], [3.0], [4.0]],
+        descriptor_names=["band_log_abs_alpha_ch-all"],
+    )
+
+    with pytest.raises(ValueError, match="duplicate feature names"):
+        container.aggregate_groups(
+            by=["s1", "s1", "s2", "s2"],
+            groups=[
+                {"stats": "mean", "names": ["band_log_abs_alpha_ch-all"]},
+                {"stats": "mean", "prefixes": ["band_log_abs_"]},
+            ],
+        )
+
+
+def test_aggregate_groups_selectors_and_validation(sample_container):
+    """Test selector helpers and input validation in aggregate_groups."""
+    sample_container.dims = ("obs", "feature")
+    sample_container.coords["feature"] = ["a", "b"]
+    sample_container.X = np.zeros((2, 2))
+
+    # 1. Unknown keys
+    with pytest.raises(ValueError, match="Unknown aggregate_groups keys"):
+        groups = [{"stats": "mean", "invalid": 1}]
+        sample_container.aggregate_groups(by="group", groups=groups)
+
+    # 2. Missing stats
+    with pytest.raises(ValueError, match="must include `stats`"):
+        sample_container.aggregate_groups(by="group", groups=[{"names": ["a"]}])
+
+    # 3. No match when skipping is disabled
+    with pytest.raises(ValueError, match="matched no features"):
+        sample_container.aggregate_groups(
+            by="group",
+            groups=[{"names": ["missing"], "stats": "mean"}],
+            skip_empty=False,
+        )
+
+    agg_empty_skipped = sample_container.aggregate_groups(
+        by=[0, 1],
+        groups=[
+            {"names": ["missing"], "stats": "mean"},
+            {"names": ["a"], "stats": "mean"},
+        ],
+    )
+    assert agg_empty_skipped.coords["feature"].tolist() == ["mean_a"]
+
+    # Selector variety
+    container = _make_descriptor_container(
+        np.zeros((4, 4)), descriptor_names=["aa", "ab", "ba", "bb"]
+    )
+    # Check regex and contains in one go
+    agg = container.aggregate_groups(
+        by=[0, 0, 1, 1],
+        groups=[
+            {"contains": ["a"], "stats": "mean"},
+            {"regex": ["^b"], "stats": "median"},
+            {"suffixes": ["b"], "stats": "max"},
+        ],
+    )
+    assert "mean_aa" in agg.coords["feature"]
+    assert "median_ba" in agg.coords["feature"]
+    assert "max_bb" in agg.coords["feature"]
+    agg2 = container.aggregate_groups(
+        by=[0, 0, 1, 1],
+        groups=[
+            {"contains": ["a"], "stats": "mean"},
+            {"suffixes": ["b"], "stats": "median"},
+        ],
+    )
+    assert "mean_aa" in agg2.coords["feature"]
+    assert "median_ab" in agg2.coords["feature"]
+
+
+def test_aggregate_groups_meta_and_consistency(sample_container):
+    """Test meta propagation and consistency checks in aggregate_groups."""
+    sample_container.dims = ("obs", "feature")
+    sample_container.coords["feature"] = ["f1", "f2"]
+    sample_container.X = np.zeros((2, 2))
+
+    # 2. Failures collection
+    sample_container.meta["aggregate_failures"] = [
+        {
+            "family": "bands",
+            "obs_index": 0,
+            "obs_id": "s0",
+            "channel_index": 0,
+            "channel_name": "ch0",
+            "exception_type": "Error",
+            "message": "msg",
+        }
+    ]
+    # isel will keep meta. aggregate will keep meta.
+    agg = sample_container.aggregate_groups(
+        by=[0, 1], groups=[{"names": ["f1"], "stats": "mean", "name": "G1"}]
+    )
+    assert len(agg.meta.get("aggregate_failures", [])) > 0
+    assert agg.meta["aggregate_failures"][0]["aggregate_group_name"] == "G1"
+
+
+def test_aggregate_groups_consistency_checks(sample_container):
+    """Verify mixed per-group stats are flattened into one feature axis."""
+    sample_container.dims = ("obs", "feature")
+    sample_container.coords["feature"] = ["f1", "f2"]
+    sample_container.X = np.zeros((2, 2))
+
+    agg = sample_container.aggregate_groups(
+        by=[0, 1],
+        groups=[
+            {"names": ["f1"], "stats": ["mean", "median"]},
+            {"names": ["f2"], "stats": "mean"},
+        ],
+    )
+
+    assert agg.dims == ("obs", "feature")
+    assert agg.coords["feature"].tolist() == ["mean_f1", "median_f1", "mean_f2"]
+
+
 def test_aggregate_min_count_collect_policy_records_failure():
     agg = _make_grouped_descriptor_container().aggregate(
         by=["g1", "g1", "g2", "g2"],
@@ -467,7 +726,6 @@ def test_aggregate_descriptor_pipeline_output_can_be_grouped():
     X = _make_signal_data()
     result = DescriptorPipeline(
         {
-            "output": {"channel_pooling": "all"},
             "families": {"bands": {"enabled": True, "outputs": ["absolute_power"]}},
         }
     ).extract(X=X, sfreq=256.0, channel_names=["Fz", "Cz"])
@@ -477,19 +735,24 @@ def test_aggregate_descriptor_pipeline_output_can_be_grouped():
     )
 
     assert all("_global" not in name for name in result["descriptor_names"])
-    assert any(name.endswith("_ch-all") for name in result["descriptor_names"])
+    assert any(name.endswith("_ch-Fz") for name in result["descriptor_names"])
     assert agg.X.shape == (2, result["X"].shape[1])
     assert agg.dims == ("obs", "feature")
 
 
 def test_aggregate_descriptor_pipeline_preserves_channel_group_tokens():
     X = _make_signal_data()
-    result = DescriptorPipeline(
+    pipe = DescriptorPipeline(
         {
-            "output": {"channel_pooling": {"Frontal": ["Fz", "Cz"]}},
             "families": {"bands": {"enabled": True, "outputs": ["absolute_power"]}},
         }
-    ).extract(X=X, sfreq=256.0, channel_names=["Fz", "Cz"])
+    )
+    result = pipe.extract(
+        X=X,
+        sfreq=256.0,
+        channel_names=["Fz", "Cz"],
+    )
+    result = pipe.pool_channels(result, {"Frontal": ["Fz", "Cz"]})
     agg = _descriptor_result_container(result).aggregate(
         by=["s1", "s1", "s1", "s2", "s2", "s2"],
         stats=["mean", "std"],
@@ -617,6 +880,8 @@ def test_aggregate_all_stats(sample_container):
         "std",
         "var",
         "sem",
+        "obs-mad",
+        "obs-iqr",
         "min",
         "max",
         "first",
@@ -631,6 +896,8 @@ def test_aggregate_all_stats(sample_container):
         "std",
         "var",
         "sem",
+        "mad",
+        "iqr",
         "min",
         "max",
         "first",

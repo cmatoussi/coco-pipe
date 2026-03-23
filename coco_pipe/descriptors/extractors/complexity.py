@@ -27,8 +27,7 @@ import numpy as np
 
 from ...utils import import_optional_dependency
 from ..configs import ComplexityDescriptorConfig
-from .base import BaseDescriptorExtractor, _DescriptorBlock
-from .utils import make_failure_record
+from .base import BaseDescriptorExtractor, _DescriptorBlock, make_failure_record
 
 
 class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
@@ -56,8 +55,8 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
     Notes
     -----
     The extractor always computes descriptor values per sensor first. Public
-    output pooling, such as `channel_pooling="all"` or grouped channel pooling,
-    is applied afterward through :meth:`BaseDescriptorExtractor._finalize_descriptor`.
+    deterministic sensor-level naming is applied afterward through
+    :meth:`BaseDescriptorExtractor._finalize_descriptor`.
 
     When `antropy` is selected, the extractor uses batched calls where the
     backend supports them and falls back to scalar loops for measures that are
@@ -136,7 +135,6 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
         X: np.ndarray,
         sfreq: float | None,
         channel_names: list[str] | None,
-        channel_pooling: str | dict[str, list[str]],
         ids: np.ndarray | None,
         runtime,
         obs_offset: int = 0,
@@ -154,9 +152,6 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
         channel_names : list of str, optional
             Explicit channel labels aligned with axis 1 of ``X``. If omitted,
             fallback names ``"ch-0"``, ``"ch-1"``, ... are used internally.
-        channel_pooling : {"none", "all"} or dict
-            Descriptor-level channel pooling policy applied after per-sensor
-            complexity values are computed.
         ids : np.ndarray, optional
             Observation identifiers aligned with axis 0 of ``X``.
         runtime : DescriptorRuntimeConfig
@@ -193,16 +188,12 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
         ``failures`` unless `runtime.on_error == "raise"`, in which case the
         extractor fails immediately.
 
-        Examples
-        --------
-        With ``channel_pooling="none"`` and
-        ``channel_names=["Fz", "Cz"]``, a requested measure such as
+        Example
+        -------
+        With ``channel_names=["Fz", "Cz"]``, a requested measure such as
         ``perm_entropy`` yields channel-resolved names like
         ``complexity_perm_entropy_ch-Fz`` and
         ``complexity_perm_entropy_ch-Cz``.
-
-        With ``channel_pooling="all"``, the same metric yields one pooled
-        column named ``complexity_perm_entropy_ch-all``.
         """
         channel_names = channel_names or [f"ch-{idx}" for idx in range(X.shape[1])]
 
@@ -382,7 +373,6 @@ class ComplexityDescriptorExtractor(BaseDescriptorExtractor):
                 family_prefix="complexity",
                 metric_name=measure,
                 channel_names=channel_names,
-                channel_pooling=channel_pooling,
             )
             chunk_features.append(feature)
             chunk_names.extend(names)

@@ -177,6 +177,82 @@ class DataContainer:
             f"coords={list(self.coords.keys())}>"
         )
 
+    def obs_table(
+        self,
+        include_ids: bool = False,
+        id_col: str = "obs_id",
+        include_y: bool = False,
+        y_col: str = "y",
+        include_obs_coord: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Return one-dimensional coordinates aligned to the observation axis.
+
+        This helper is useful when exporting a row-wise table from a container.
+        It only materializes metadata that can map cleanly to one row per
+        observation, skipping coordinates that belong to other axes such as
+        ``channel``, ``time``, ``feature``, or ``stat``.
+
+        Parameters
+        ----------
+        include_ids : bool, default=False
+            If True, include ``self.ids`` as the first column.
+        id_col : str, default="obs_id"
+            Column name used when exporting ``self.ids``.
+        include_y : bool, default=False
+            If True, include ``self.y`` as a column when present.
+        y_col : str, default="y"
+            Column name used when exporting ``self.y``.
+        include_obs_coord : bool, default=False
+            If True, include ``coords["obs"]`` when present.
+
+        Returns
+        -------
+        pandas.DataFrame
+            DataFrame containing only one-dimensional observation-aligned
+            metadata columns.
+
+        Raises
+        ------
+        ValueError
+            If the container has no ``obs`` dimension, or if ``include_ids`` is
+            requested when ``self.ids`` is missing.
+        """
+        if "obs" not in self.dims:
+            raise ValueError("Observation metadata export requires an 'obs' dimension.")
+
+        obs_len = self.X.shape[self.dims.index("obs")]
+        data: Dict[str, np.ndarray] = {}
+
+        if include_ids:
+            if self.ids is None:
+                raise ValueError("`include_ids=True` requires `DataContainer.ids`.")
+            ids = np.asarray(self.ids, dtype=object)
+            if ids.ndim != 1 or len(ids) != obs_len:
+                raise ValueError("`DataContainer.ids` must be 1D and aligned to 'obs'.")
+            data[id_col] = ids
+
+        if include_obs_coord and "obs" in self.coords:
+            obs_coord = np.asarray(self.coords["obs"], dtype=object)
+            if obs_coord.ndim == 1 and len(obs_coord) == obs_len:
+                data["obs"] = obs_coord
+
+        for key, values in self.coords.items():
+            if key == "obs":
+                continue
+            arr = np.asarray(values, dtype=object)
+            if arr.ndim == 1 and len(arr) == obs_len:
+                data[key] = arr
+
+        if include_y and self.y is not None:
+            y = np.asarray(self.y, dtype=object)
+            if y.ndim != 1 or len(y) != obs_len:
+                raise ValueError("`DataContainer.y` must be 1D and aligned to 'obs'.")
+            if y_col not in data:
+                data[y_col] = y
+
+        return pd.DataFrame(data)
+
     def isel(self, **indexers) -> "DataContainer":
         """
         Select data by integer indices on specified dimensions.
@@ -1241,8 +1317,9 @@ class DataContainer:
         stats : str or sequence of str, default="mean"
             Aggregation statistic or ordered list of statistics. Supported
             tokens are ``"mean"``, ``"median"``, ``"std"``, ``"var"``,
-            ``"sem"``, ``"min"``, ``"max"``, ``"count"``, and ``"first"``.
-            Legacy ``"obs-*"`` aliases are accepted and normalized.
+            ``"sem"``, ``"mad"``, ``"iqr"``, ``"min"``, ``"max"``,
+            ``"count"``, and ``"first"``. Legacy ``"obs-*"`` aliases are
+            accepted and normalized.
         min_count : int, default=1
             Minimum number of valid observations required per group. A valid
             observation is one with at least one finite value across the
@@ -1282,6 +1359,8 @@ class DataContainer:
             "obs-std": "std",
             "obs-var": "var",
             "obs-sem": "sem",
+            "obs-mad": "mad",
+            "obs-iqr": "iqr",
             "obs-min": "min",
             "obs-max": "max",
             "obs-count": "count",
@@ -1292,6 +1371,8 @@ class DataContainer:
             "std",
             "var",
             "sem",
+            "mad",
+            "iqr",
             "min",
             "max",
             "count",
@@ -1372,6 +1453,22 @@ class DataContainer:
                 elif stat == "sem":
                     values_flat = np.nanstd(group_X_flat, axis=0) / np.sqrt(
                         counts_flat.astype(np.float64)
+                    )
+                elif stat == "mad":
+                    medians_flat = np.nanmedian(group_X_flat, axis=0)
+                    values_flat = np.nanmedian(
+                        np.abs(group_X_flat - medians_flat),
+                        axis=0,
+                    )
+                elif stat == "iqr":
+                    values_flat = np.nanpercentile(
+                        group_X_flat,
+                        75,
+                        axis=0,
+                    ) - np.nanpercentile(
+                        group_X_flat,
+                        25,
+                        axis=0,
                     )
                 elif stat == "min":
                     values_flat = np.nanmin(group_X_flat, axis=0)
@@ -1531,6 +1628,252 @@ class DataContainer:
             y=new_y,
             dims=final_dims,
             ids=unique_groups,
+            coords=new_coords,
+            meta=meta,
+        )
+
+    def aggregate_groups(
+        self,
+        by: Union[str, np.ndarray, List[Any]],
+        groups: Sequence[Dict[str, Any]],
+        min_count: int = 1,
+        on_insufficient: str = "raise",
+        skip_empty: bool = True,
+    ) -> "DataContainer":
+        """
+        Aggregate selected feature groups with different statistics.
+
+        This is a thin wrapper around :meth:`aggregate` for tabular feature
+        containers. Each group spec selects a subset of feature columns and
+        applies one or more stats to that subset. The outputs are concatenated
+        along the ``feature`` dimension, and each resulting feature name is
+        prefixed with its stat (for example ``"mean_band_log_abs_alpha"``).
+
+        Parameters
+        ----------
+        by : str or array-like
+            Group definition for the observation axis. Passed through to
+            :meth:`aggregate`.
+        groups : sequence of dict
+            Ordered group specifications. Each group must provide ``"stats"``
+            and may optionally provide include/exclude selectors:
+
+            - ``names`` / ``exclude_names``
+            - ``prefixes`` / ``exclude_prefixes``
+            - ``suffixes`` / ``exclude_suffixes``
+            - ``contains`` / ``exclude_contains``
+            - ``regex`` / ``exclude_regex``
+
+            If a group provides no include selectors, it starts from all
+            features and then applies exclusions.
+        min_count : int, default=1
+            Minimum number of valid observations required per group. Passed
+            through to :meth:`aggregate`.
+        on_insufficient : {"raise", "warn", "collect"}, default="raise"
+            Policy applied when a group has fewer than ``min_count`` valid
+            observations. Passed through to :meth:`aggregate`.
+        skip_empty : bool, default=True
+            If True, silently skip group specs that match no features. If
+            False, raise a ``ValueError`` when a group matches nothing.
+
+        Returns
+        -------
+        DataContainer
+            Aggregated container with dims ``("obs", "feature")`` and
+            stat-prefixed feature names.
+
+        Raises
+        ------
+        ValueError
+            If the container lacks a ``feature`` dimension or coord, no groups
+            are provided, a group spec is invalid, multiple groups would emit
+            the same output feature name, or no non-empty grouped outputs are
+            produced.
+        """
+        if "feature" not in self.dims:
+            raise ValueError("aggregate_groups requires a 'feature' dimension.")
+        if "feature" not in self.coords:
+            raise ValueError("aggregate_groups requires a 'feature' coordinate.")
+        if not groups:
+            raise ValueError("`groups` must not be empty.")
+
+        feature_names = np.asarray(self.coords["feature"], dtype=object)
+        feature_axis = self.dims.index("feature")
+        include_keys = ("names", "prefixes", "suffixes", "contains", "regex")
+        exclude_keys = tuple(f"exclude_{key}" for key in include_keys)
+        allowed_group_keys = {"name", "stats", *include_keys, *exclude_keys}
+
+        def _normalize_patterns(value: Any) -> Tuple[str, ...]:
+            if value is None:
+                return ()
+            if isinstance(value, str):
+                return (value,)
+            return tuple(str(item) for item in value)
+
+        def _selector_mask(spec: Dict[str, Any], *, exclude: bool) -> np.ndarray:
+            selector_keys = exclude_keys if exclude else include_keys
+            mask = np.zeros(feature_names.size, dtype=bool)
+            for key in selector_keys:
+                patterns = _normalize_patterns(spec.get(key))
+                if not patterns:
+                    continue
+                base_key = key.removeprefix("exclude_")
+                if base_key == "names":
+                    mask |= np.isin(feature_names.astype(str), patterns)
+                elif base_key == "prefixes":
+                    mask |= np.array(
+                        [
+                            any(str(name).startswith(pattern) for pattern in patterns)
+                            for name in feature_names
+                        ],
+                        dtype=bool,
+                    )
+                elif base_key == "suffixes":
+                    mask |= np.array(
+                        [
+                            any(str(name).endswith(pattern) for pattern in patterns)
+                            for name in feature_names
+                        ],
+                        dtype=bool,
+                    )
+                elif base_key == "contains":
+                    mask |= np.array(
+                        [
+                            any(pattern in str(name) for pattern in patterns)
+                            for name in feature_names
+                        ],
+                        dtype=bool,
+                    )
+                elif base_key == "regex":
+                    compiled = [re.compile(pattern) for pattern in patterns]
+                    mask |= np.array(
+                        [
+                            any(pattern.search(str(name)) for pattern in compiled)
+                            for name in feature_names
+                        ],
+                        dtype=bool,
+                    )
+            return mask
+
+        combined_parts: List[np.ndarray] = []
+        combined_feature_names: List[str] = []
+        aggregate_failures: List[Dict[str, Any]] = []
+        base_agg: Optional["DataContainer"] = None
+
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, dict):
+                raise ValueError("Each entry in `groups` must be a dict.")
+
+            unknown_keys = sorted(set(group) - allowed_group_keys)
+            if unknown_keys:
+                raise ValueError(
+                    f"Unknown aggregate_groups keys: {unknown_keys}. "
+                    f"Supported keys are: {sorted(allowed_group_keys)}"
+                )
+            if "stats" not in group:
+                raise ValueError("Each aggregate_groups spec must include `stats`.")
+
+            stats_spec = group["stats"]
+            if isinstance(stats_spec, str):
+                stats_out = [stats_spec]
+            else:
+                stats_out = [str(stat) for stat in stats_spec]
+            if not stats_out:
+                raise ValueError(
+                    "Each aggregate_groups spec must include at least one stat."
+                )
+
+            include_mask = _selector_mask(group, exclude=False)
+            has_include_selectors = any(
+                group.get(key) is not None for key in include_keys
+            )
+            if not has_include_selectors:
+                include_mask = np.ones(feature_names.size, dtype=bool)
+            exclude_mask = _selector_mask(group, exclude=True)
+            selected_mask = include_mask & ~exclude_mask
+            feature_indices = np.flatnonzero(selected_mask)
+            if feature_indices.size == 0:
+                if skip_empty:
+                    continue
+                group_name = group.get("name", f"index {group_index}")
+                raise ValueError(
+                    f"aggregate_groups spec {group_name!r} matched no features."
+                )
+
+            subset = self.isel(feature=feature_indices.tolist())
+            for stat in stats_out:
+                grouped = subset.aggregate(
+                    by=by,
+                    stats=stat,
+                    min_count=min_count,
+                    on_insufficient=on_insufficient,
+                )
+                prefixed_names = [
+                    f"{stat}_{name}"
+                    for name in np.asarray(grouped.coords["feature"], dtype=object)
+                ]
+                duplicate_names = sorted(
+                    set(prefixed_names).intersection(combined_feature_names)
+                )
+                if duplicate_names:
+                    raise ValueError(
+                        "aggregate_groups would emit duplicate feature names: "
+                        f"{duplicate_names}"
+                    )
+
+                if base_agg is None:
+                    base_agg = grouped
+                else:
+                    if grouped.dims != base_agg.dims:
+                        raise ValueError(
+                            "aggregate_groups requires all grouped outputs to "
+                            "share the same dimensions."
+                        )
+                    if not np.array_equal(grouped.ids, base_agg.ids):
+                        raise ValueError(
+                            "aggregate_groups requires all grouped outputs to "
+                            "share the same grouped observation ids."
+                        )
+
+                combined_parts.append(np.asarray(grouped.X, dtype=np.float64))
+                combined_feature_names.extend(prefixed_names)
+
+                failures = grouped.meta.get("aggregate_failures", [])
+                for failure in failures:
+                    failure_out = deepcopy(failure)
+                    failure_out["aggregate_group_index"] = group_index
+                    if "name" in group:
+                        failure_out["aggregate_group_name"] = group["name"]
+                    failure_out["aggregate_stat"] = stat
+                    aggregate_failures.append(failure_out)
+
+        if base_agg is None:  # pragma: no cover - guarded above
+            raise ValueError("aggregate_groups produced no aggregated outputs.")
+
+        new_coords = deepcopy(base_agg.coords)
+        new_coords["feature"] = np.asarray(combined_feature_names, dtype=object)
+        meta = deepcopy(self.meta)
+        unique_stats = list(
+            dict.fromkeys(name.split("_", 1)[0] for name in combined_feature_names)
+        )
+        meta.update(
+            {
+                "aggregated": True,
+                "agg_by": by if isinstance(by, str) else None,
+                "agg_stats": unique_stats,
+                "agg_groups": deepcopy(list(groups)),
+                "min_count": int(min_count),
+            }
+        )
+        if aggregate_failures:
+            meta["aggregate_failures"] = aggregate_failures
+        elif "aggregate_failures" in meta:
+            del meta["aggregate_failures"]
+
+        X_out = np.concatenate(combined_parts, axis=feature_axis)
+        return replace(
+            base_agg,
+            X=X_out,
             coords=new_coords,
             meta=meta,
         )

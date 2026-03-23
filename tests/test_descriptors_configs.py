@@ -53,18 +53,15 @@ def test_corrected_bands_require_parametric_fit_range_to_cover_band_window():
         )
 
 
-def test_channel_pooling_accepts_none_all_or_mapping():
-    assert (
-        DescriptorConfig(output={"channel_pooling": "none"}).output.channel_pooling
-        == "none"
-    )
-    assert (
-        DescriptorConfig(output={"channel_pooling": "all"}).output.channel_pooling
-        == "all"
-    )
-    assert DescriptorConfig(
-        output={"channel_pooling": {"Frontal": ["Fz", "Cz"]}}
-    ).output.channel_pooling == {"Frontal": ["Fz", "Cz"]}
+def test_channel_pooling_config_field_is_rejected():
+    with pytest.raises(ValidationError):
+        DescriptorConfig(output={"channel_pooling": "none"})
+
+    with pytest.raises(ValidationError):
+        DescriptorConfig(output={"channel_pooling": "all"})
+
+    with pytest.raises(ValidationError):
+        DescriptorConfig(output={"channel_pooling": {"Frontal": ["Fz", "Cz"]}})
 
 
 def test_runtime_and_output_flags_parse_strictly():
@@ -74,10 +71,7 @@ def test_runtime_and_output_flags_parse_strictly():
                 "require_sfreq": False,
                 "require_channel_names": True,
             },
-            "output": {
-                "precision": "float64",
-                "channel_pooling": "all",
-            },
+            "precision": "float64",
             "runtime": {
                 "execution_backend": "joblib",
                 "n_jobs": -1,
@@ -89,8 +83,7 @@ def test_runtime_and_output_flags_parse_strictly():
 
     assert config.input.require_sfreq is False
     assert config.input.require_channel_names is True
-    assert config.output.precision == "float64"
-    assert config.output.channel_pooling == "all"
+    assert config.precision == "float64"
     assert config.runtime.execution_backend == "joblib"
     assert config.runtime.n_jobs == -1
     assert config.runtime.obs_chunk == 16
@@ -150,7 +143,21 @@ def test_removed_ceremonial_fields_are_rejected():
     with pytest.raises(ValidationError):
         DescriptorConfig.model_validate(
             {
+                "families": {"bands": {"log_power": True}},
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        DescriptorConfig.model_validate(
+            {
                 "output": {"channel_groups": {"Frontal": ["Fz", "Cz"]}},
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        DescriptorConfig.model_validate(
+            {
+                "output": {"channel_pooling": "none"},
             }
         )
 
@@ -230,6 +237,11 @@ def test_band_validation_edge_cases():
         DescriptorConfig(families={"bands": {"outputs": ["non_existent"]}})
 
 
+def test_band_min_denominator_power_must_be_non_negative():
+    with pytest.raises(ValidationError, match="min_denominator_power"):
+        DescriptorConfig(families={"bands": {"min_denominator_power": -1.0}})
+
+
 def test_parametric_validation_edge_cases():
     # Duplicate outputs
     with pytest.raises(ValidationError, match="duplicates"):
@@ -263,34 +275,17 @@ def test_complexity_validation_edge_cases():
 
 
 def test_channel_pooling_validation_edge_cases():
-    # Invalid string
-    with pytest.raises(
-        ValidationError,
-        match="Input should be 'none' or 'all'|Input should be a valid dictionary",
-    ):
+    with pytest.raises(ValidationError):
         DescriptorConfig(output={"channel_pooling": "some_string"})
 
-    # Empty group name
-    with pytest.raises(ValidationError, match="non-empty strings"):
+    with pytest.raises(ValidationError):
         DescriptorConfig(output={"channel_pooling": {"": ["ch1"]}})
 
-    # Empty members
-    with pytest.raises(ValidationError, match="at least one channel"):
+    with pytest.raises(ValidationError):
         DescriptorConfig(output={"channel_pooling": {"G1": []}})
 
-    # Duplicate members
-    with pytest.raises(ValidationError, match="not contain duplicates"):
+    with pytest.raises(ValidationError):
         DescriptorConfig(output={"channel_pooling": {"G1": ["ch1", "ch1"]}})
-
-    # Coerce None/{} to none
-    assert (
-        DescriptorConfig(output={"channel_pooling": None}).output.channel_pooling
-        == "none"
-    )
-    assert (
-        DescriptorConfig(output={"channel_pooling": {}}).output.channel_pooling
-        == "none"
-    )
 
 
 def test_coercion_logic_smoke():

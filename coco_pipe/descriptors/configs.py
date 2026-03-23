@@ -9,7 +9,7 @@ extraction:
 
 - explicit runtime input requirements
 - family-specific configs for bands, parametric fitting, and complexity
-- output formatting controls
+- final output precision control
 - runtime execution controls
 
 These models validate local field structure and family-local constraints. The
@@ -32,7 +32,6 @@ __all__ = [
     "ParametricDescriptorConfig",
     "ComplexityDescriptorConfig",
     "DescriptorFamiliesConfig",
-    "DescriptorOutputConfig",
     "DescriptorRuntimeConfig",
     "DescriptorConfig",
 ]
@@ -48,9 +47,11 @@ CANONICAL_BANDS = {
 
 _BAND_OUTPUTS = (
     "absolute_power",
+    "log_absolute_power",
     "relative_power",
     "ratios",
     "corrected_absolute_power",
+    "corrected_log_absolute_power",
     "corrected_relative_power",
     "corrected_ratios",
 )
@@ -108,14 +109,17 @@ class BandDescriptorConfig(_StrictConfigModel):
         Global frequency window within which PSDs and bands are evaluated.
     bands : dict of str to tuple of float, default=canonical EEG bands
         Mapping from band name to ``(low, high)`` boundaries.
-    outputs : list of {"absolute_power", "relative_power", "ratios", \
-"corrected_absolute_power", "corrected_relative_power", "corrected_ratios"}
+    outputs : list of {"absolute_power", "log_absolute_power", \
+"relative_power", "ratios", "corrected_absolute_power", \
+"corrected_log_absolute_power", "corrected_relative_power", \
+"corrected_ratios"}
         Band descriptors to emit.
     ratio_pairs : list of tuple of str, default=[]
         Explicit numerator and denominator band names for ratio outputs.
-    log_power : bool, default=False
-        Whether to emit log-transformed absolute band power in addition to
-        absolute power when that output is enabled.
+    min_denominator_power : float, default=0.0
+        Minimum denominator power required for relative-power and ratio
+        outputs. Any denominator at or below this threshold is treated as
+        undefined and yields ``NaN`` instead of an unstable division result.
 
     Notes
     -----
@@ -135,15 +139,17 @@ class BandDescriptorConfig(_StrictConfigModel):
     outputs: list[
         Literal[
             "absolute_power",
+            "log_absolute_power",
             "relative_power",
             "ratios",
             "corrected_absolute_power",
+            "corrected_log_absolute_power",
             "corrected_relative_power",
             "corrected_ratios",
         ]
     ] = Field(default_factory=lambda: ["absolute_power"])
     ratio_pairs: list[tuple[str, str]] = Field(default_factory=list)
-    log_power: bool = False
+    min_denominator_power: float = Field(0.0, ge=0.0)
 
     @field_validator("bands", mode="before")
     @classmethod
@@ -309,70 +315,6 @@ class DescriptorFamiliesConfig(_StrictConfigModel):
     )
 
 
-class DescriptorOutputConfig(_StrictConfigModel):
-    """
-    Controls output precision and descriptor-level channel pooling.
-
-    Parameters
-    ----------
-    precision : {"float32", "float64"}, default="float32"
-        Output dtype used for the final descriptor matrix.
-    channel_pooling : {"none", "all"} or dict of str to list of str, default="none"
-        Descriptor-level channel pooling policy applied after per-channel
-        descriptors are computed. ``"none"`` keeps one descriptor per sensor,
-        ``"all"`` averages descriptor values across all sensors, and a mapping
-        averages descriptor values within each named group while leaving
-        ungrouped sensors unchanged.
-
-    Notes
-    -----
-    Output config is intentionally small. The descriptors module now returns a
-    minimal result object, so output controls are limited to matrix precision
-    and descriptor-level channel pooling.
-    """
-
-    precision: Literal["float32", "float64"] = "float32"
-    channel_pooling: Literal["none", "all"] | dict[str, list[str]] = "none"
-
-    @field_validator("channel_pooling", mode="before")
-    @classmethod
-    def _coerce_channel_pooling(
-        cls, value: Any
-    ) -> Literal["none", "all"] | dict[str, list[str]]:
-        if value in (None, {}):
-            return "none"
-        if isinstance(value, str):
-            return value
-        return {
-            str(group_name): [str(member) for member in members]
-            for group_name, members in dict(value).items()
-        }
-
-    @field_validator("channel_pooling")
-    @classmethod
-    def _validate_channel_pooling(
-        cls, value: Literal["none", "all"] | dict[str, list[str]]
-    ) -> Literal["none", "all"] | dict[str, list[str]]:
-        if isinstance(value, str):
-            if value not in {"none", "all"}:
-                raise ValueError("channel_pooling must be 'none', 'all', or a mapping.")
-            return value
-        for group_name, members in value.items():
-            if not group_name:
-                raise ValueError(
-                    "channel_pooling mapping keys must be non-empty strings."
-                )
-            if not members:
-                raise ValueError(
-                    f"channel_pooling['{group_name}'] must define at least one channel."
-                )
-            if len(set(members)) != len(members):
-                raise ValueError(
-                    f"channel_pooling['{group_name}'] must not contain duplicates."
-                )
-        return value
-
-
 class DescriptorRuntimeConfig(_StrictConfigModel):
     """
     Runtime execution controls for descriptor extraction.
@@ -427,8 +369,8 @@ class DescriptorConfig(_StrictConfigModel):
         Runtime input requirements for explicit array extraction.
     families : DescriptorFamiliesConfig
         Enabled descriptor families and their typed configs.
-    output : DescriptorOutputConfig
-        Output precision and formatting settings.
+    precision : {"float32", "float64"}
+        Output dtype used for the final descriptor matrix.
     runtime : DescriptorRuntimeConfig
         Runtime execution and error-handling settings.
 
@@ -442,5 +384,5 @@ class DescriptorConfig(_StrictConfigModel):
 
     input: DescriptorInputConfig = Field(default_factory=DescriptorInputConfig)
     families: DescriptorFamiliesConfig = Field(default_factory=DescriptorFamiliesConfig)
-    output: DescriptorOutputConfig = Field(default_factory=DescriptorOutputConfig)
+    precision: Literal["float32", "float64"] = "float32"
     runtime: DescriptorRuntimeConfig = Field(default_factory=DescriptorRuntimeConfig)

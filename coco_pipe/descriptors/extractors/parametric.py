@@ -29,8 +29,7 @@ import numpy as np
 from ..configs import ParametricDescriptorConfig
 from ._parametric_fit import _ParametricFitBatch, fit_parametric_batch
 from ._psd import compute_psd
-from .base import BasePSDDescriptorExtractor, _DescriptorBlock
-from .utils import make_failure_record
+from .base import BasePSDDescriptorExtractor, _DescriptorBlock, make_failure_record
 
 
 class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
@@ -57,8 +56,7 @@ class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
     Notes
     -----
     The extractor always computes descriptor values per sensor first. Public
-    output pooling, such as `channel_pooling="all"` or grouped channel pooling,
-    is applied afterward through
+    sensor-level naming is applied afterward through
     :meth:`BaseDescriptorExtractor._finalize_descriptor`.
 
     When the pipeline provides a precomputed PSD batch through
@@ -111,7 +109,6 @@ class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
         psds: np.ndarray,
         freqs: np.ndarray,
         channel_names: list[str] | None,
-        channel_pooling: str | dict[str, list[str]],
         ids: np.ndarray | None,
         runtime,
         obs_offset: int = 0,
@@ -130,9 +127,6 @@ class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
             Explicit channel labels aligned with axis 1 of ``psds``. If
             omitted, fallback names ``"ch-0"``, ``"ch-1"``, ... are used
             internally.
-        channel_pooling : {"none", "all"} or dict
-            Descriptor-level channel pooling policy applied after per-sensor
-            parametric values are computed.
         ids : np.ndarray, optional
             Observation identifiers aligned with axis 0 of ``psds``.
         runtime : DescriptorRuntimeConfig
@@ -195,7 +189,6 @@ class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
                 family_prefix="param",
                 metric_name=metric_name,
                 channel_names=channel_names,
-                channel_pooling=channel_pooling,
             )
             chunk_features.append(feature)
             descriptor_names.extend(names)
@@ -218,7 +211,6 @@ class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
         X: np.ndarray,
         sfreq: float | None,
         channel_names: list[str] | None,
-        channel_pooling: str | dict[str, list[str]],
         ids: np.ndarray | None,
         runtime,
         obs_offset: int = 0,
@@ -234,9 +226,6 @@ class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
             Sampling frequency in Hertz.
         channel_names : list of str, optional
             Explicit channel labels aligned with axis 1 of ``X``.
-        channel_pooling : {"none", "all"} or dict
-            Descriptor-level channel pooling policy applied after per-sensor
-            parametric values are computed.
         ids : np.ndarray, optional
             Observation identifiers aligned with axis 0 of ``X``.
         runtime : DescriptorRuntimeConfig
@@ -288,7 +277,6 @@ class ParametricDescriptorExtractor(BasePSDDescriptorExtractor):
             psds,
             freqs,
             channel_names=channel_names,
-            channel_pooling=channel_pooling,
             ids=ids,
             runtime=runtime,
             obs_offset=obs_offset,

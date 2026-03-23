@@ -8,11 +8,12 @@ extractors. The module exposes:
   batches
 - `BasePSDDescriptorExtractor` for families that consume shared PSD batches
 - `_DescriptorBlock` as the private family output payload
+- `make_failure_record` as the shared normalized failure-record helper
 
 The surrounding descriptors stack uses these interfaces to provide:
 
 - explicit runtime dispatch from `DescriptorPipeline`
-- deterministic descriptor naming and channel reduction helpers
+- deterministic sensor-level descriptor naming
 - family-wise metadata and failure collection
 - safe merging of family outputs into one stable result dictionary
 
@@ -21,19 +22,6 @@ Notes
 `BaseDescriptorExtractor` is an internal extension point for descriptor
 families. Unlike dim-reduction reducers, descriptor extractors are stateless at
 runtime and do not expose `fit`, persistence, or model objects.
-
-Examples
---------
-The shared finalization helper converts per-channel descriptor values into the
-public column naming convention based on ``output.channel_pooling``:
-
-- ``channel_pooling="none"``:
-  ``band_abs_alpha_ch-Fz``, ``band_abs_alpha_ch-Cz``
-- ``channel_pooling="all"``:
-  ``band_abs_alpha_ch-all``
-- ``channel_pooling={"Frontal": ["Fz", "Cz"]}``:
-  ``band_abs_alpha_chgrp-Frontal`` plus any ungrouped channels such as
-  ``band_abs_alpha_ch-Pz``
 
 Author: Hamza Abdelhedi (hamza.abdelhedi@umontreal.ca)
 """
@@ -47,9 +35,12 @@ from typing import Any
 import numpy as np
 
 from ..configs import DescriptorRuntimeConfig
-from .utils import pool_channel_descriptor_matrix
 
-__all__ = ["BaseDescriptorExtractor", "BasePSDDescriptorExtractor"]
+__all__ = [
+    "BaseDescriptorExtractor",
+    "BasePSDDescriptorExtractor",
+    "make_failure_record",
+]
 
 
 @dataclass(slots=True)
@@ -84,13 +75,34 @@ class _DescriptorBlock:
     failures: list[dict[str, Any]] = field(default_factory=list)
 
 
+def make_failure_record(
+    family: str,
+    obs_index: int,
+    obs_id: Any = None,
+    channel_index: int | None = None,
+    channel_name: str | None = None,
+    exception_type: str | None = None,
+    message: str | None = None,
+) -> dict[str, Any]:
+    """Create one normalized extractor failure record."""
+    return {
+        "family": family,
+        "obs_index": obs_index,
+        "obs_id": obs_id,
+        "channel_index": channel_index,
+        "channel_name": channel_name,
+        "exception_type": exception_type,
+        "message": message,
+    }
+
+
 class BaseDescriptorExtractor(ABC):
     """
     Abstract base class for descriptor extraction families.
 
     Subclasses receive already validated NumPy inputs and must return one
     `_DescriptorBlock` aligned on the observation axis. The base class keeps
-    the extractor API narrow and provides a shared helper for channel
+    the extractor API narrow and provides a shared helper for sensor-level
     finalization and deterministic descriptor naming.
 
     Parameters
@@ -129,7 +141,6 @@ class BaseDescriptorExtractor(ABC):
     ...         X,
     ...         sfreq,
     ...         channel_names,
-    ...         channel_pooling,
     ...         ids,
     ...         runtime,
     ...     ):
@@ -139,7 +150,6 @@ class BaseDescriptorExtractor(ABC):
     ...             family_prefix="toy",
     ...             metric_name="mean",
     ...             channel_names=channel_names,
-    ...             channel_pooling=channel_pooling,
     ...         )
     ...         return _DescriptorBlock(
     ...             family=self.family_name,
@@ -184,7 +194,6 @@ class BaseDescriptorExtractor(ABC):
         X: np.ndarray,
         sfreq: float | None,
         channel_names: list[str] | None,
-        channel_pooling: str | dict[str, list[str]],
         ids: np.ndarray | None,
         runtime: DescriptorRuntimeConfig,
         obs_offset: int = 0,
@@ -199,9 +208,6 @@ class BaseDescriptorExtractor(ABC):
             Sampling frequency in Hertz.
         channel_names : list of str, optional
             Explicit channel labels aligned with axis 1 of ``X``.
-        channel_pooling : {"none", "all"} or dict
-            Descriptor-level channel pooling policy applied after per-channel
-            descriptors are computed.
         ids : np.ndarray, optional
             Observation identifiers aligned with axis 0 of ``X``.
         runtime : DescriptorRuntimeConfig
@@ -225,8 +231,8 @@ class BaseDescriptorExtractor(ABC):
         Notes
         -----
         The recommended pattern is to keep family-specific computation local to
-        the extractor and delegate all public channel naming and channel pooling
-        behavior to :meth:`_finalize_descriptor`.
+        the extractor and delegate sensor-level naming behavior to
+        :meth:`_finalize_descriptor`.
         """
 
     def _finalize_descriptor(
@@ -235,9 +241,8 @@ class BaseDescriptorExtractor(ABC):
         family_prefix: str,
         metric_name: str,
         channel_names: list[str] | None,
-        channel_pooling: str | dict[str, list[str]] = "none",
     ) -> tuple[np.ndarray, list[str]]:
-        """Pool channels and build deterministic descriptor names.
+        """Build deterministic sensor-level descriptor names.
 
         Parameters
         ----------
@@ -250,8 +255,6 @@ class BaseDescriptorExtractor(ABC):
             Family-local metric identifier used in the descriptor name.
         channel_names : list of str, optional
             Channel labels used when building channel-resolved descriptor names.
-        channel_pooling : {"none", "all"} or dict, default="none"
-            Descriptor-level channel pooling policy.
 
         Returns
         -------
@@ -262,34 +265,26 @@ class BaseDescriptorExtractor(ABC):
         Notes
         -----
         This helper assumes ``values`` already represents descriptor values, not
-        raw signals. Pooling therefore always happens at the descriptor level:
-
-        - ``"none"`` keeps one column per sensor
-        - ``"all"`` averages descriptor values across all sensors
-        - a mapping averages descriptor values within each named group and keeps
-          ungrouped sensors as individual columns
+        raw signals. It therefore only handles the stable sensor-level naming
+        convention used by the public extract result.
 
         Examples
         --------
         Given ``channel_names=["Fz", "Cz", "Pz"]`` and
         ``metric_name="abs_alpha"``:
 
-        - ``channel_pooling="none"`` yields
+        - yields
           ``["band_abs_alpha_ch-Fz", "band_abs_alpha_ch-Cz", "band_abs_alpha_ch-Pz"]``
-        - ``channel_pooling="all"`` yields
-          ``["band_abs_alpha_ch-all"]``
-        - ``channel_pooling={"Frontal": ["Fz", "Cz"]}`` yields
-          ``["band_abs_alpha_chgrp-Frontal", "band_abs_alpha_ch-Pz"]``
         """
         if values.ndim == 1:
             values = values[:, None]
-        pooled_values, scopes = pool_channel_descriptor_matrix(
-            values,
-            channel_names=channel_names or [],
-            channel_pooling=channel_pooling,
-        )
+        channel_names = channel_names or [f"ch-{idx}" for idx in range(values.shape[1])]
+        scopes = [
+            channel_name if channel_name.startswith("ch-") else f"ch-{channel_name}"
+            for channel_name in channel_names
+        ]
         names = ["_".join((family_prefix, metric_name, scope)) for scope in scopes]
-        return pooled_values, names
+        return values, names
 
 
 class BasePSDDescriptorExtractor(BaseDescriptorExtractor):
@@ -350,7 +345,6 @@ class BasePSDDescriptorExtractor(BaseDescriptorExtractor):
         psds: np.ndarray,
         freqs: np.ndarray,
         channel_names: list[str] | None,
-        channel_pooling: str | dict[str, list[str]],
         ids: np.ndarray | None,
         runtime: DescriptorRuntimeConfig,
         obs_offset: int = 0,
@@ -366,8 +360,6 @@ class BasePSDDescriptorExtractor(BaseDescriptorExtractor):
             Frequency grid aligned with the last axis of ``psds``.
         channel_names : list of str, optional
             Explicit channel labels aligned with the channel axis.
-        channel_pooling : {"none", "all"} or dict
-            Descriptor-level channel pooling policy.
         ids : np.ndarray, optional
             Observation identifiers aligned with the observation axis.
         runtime : DescriptorRuntimeConfig

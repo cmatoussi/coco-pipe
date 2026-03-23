@@ -2,53 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 
 from .configs import DescriptorConfig
-
-
-def _normalize_channel_pooling(
-    channel_pooling: str | Mapping[str, Sequence[str]],
-    channel_names: list[str] | None,
-) -> str | dict[str, list[str]]:
-    if channel_pooling == "none":
-        return "none"
-    if channel_pooling == "all":
-        return "all"
-    if channel_names is None:
-        raise ValueError(
-            "`channel_names` must be passed explicitly when "
-            "output.channel_pooling uses named groups."
-        )
-    if len(set(channel_names)) != len(channel_names):
-        raise ValueError(
-            "`channel_names` must be unique when output.channel_pooling uses "
-            "named groups."
-        )
-
-    known_channels = set(channel_names)
-    assigned: dict[str, str] = {}
-    normalized: dict[str, list[str]] = {}
-    for group_name, members in channel_pooling.items():
-        normalized_members = [str(member) for member in members]
-        for member in normalized_members:
-            if member not in known_channels:
-                raise ValueError(
-                    f"output.channel_pooling['{group_name}'] references unknown "
-                    f"channel '{member}'."
-                )
-            if member in assigned:
-                raise ValueError(
-                    f"Channel '{member}' is assigned to multiple channel_pooling "
-                    "groups: "
-                    f"'{assigned[member]}' and '{group_name}'."
-                )
-            assigned[member] = group_name
-        normalized[str(group_name)] = normalized_members
-    return normalized
 
 
 def validate_runtime_inputs(
@@ -109,12 +68,9 @@ def validate_runtime_inputs(
             raise ValueError("`sfreq` must be positive.")
 
     channel_names_out = None
-    channel_names_required = config.input.require_channel_names or (
-        any(
-            getattr(config.families, family_name).enabled
-            for family_name in ("bands", "parametric", "complexity")
-        )
-        and config.output.channel_pooling != "all"
+    channel_names_required = config.input.require_channel_names or any(
+        getattr(config.families, family_name).enabled
+        for family_name in ("bands", "parametric", "complexity")
     )
     if channel_names is not None:
         channel_names_out = [str(name) for name in np.asarray(channel_names).tolist()]
@@ -140,9 +96,5 @@ def validate_runtime_inputs(
         "X": X_arr,
         "ids": ids_out,
         "channel_names": channel_names_out,
-        "channel_pooling": _normalize_channel_pooling(
-            config.output.channel_pooling,
-            channel_names_out,
-        ),
         "sfreq": sfreq,
     }

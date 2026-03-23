@@ -310,7 +310,6 @@ def _process_psd_group(
     X_batch: np.ndarray,
     sfreq: float,
     channel_names: list[str] | None,
-    channel_pooling: str | dict[str, list[str]],
     ids_batch: np.ndarray | None,
     runtime,
     obs_offset: int,
@@ -330,8 +329,6 @@ def _process_psd_group(
         Sampling frequency in Hertz.
     channel_names : list of str or None
         Runtime channel labels.
-    channel_pooling : {"none", "all"} or dict
-        Descriptor-level channel pooling policy.
     ids_batch : np.ndarray or None
         Observation identifiers aligned with ``X_batch``.
     runtime : DescriptorRuntimeConfig
@@ -393,7 +390,6 @@ def _process_psd_group(
                 psds,
                 freqs,
                 channel_names=channel_names,
-                channel_pooling=channel_pooling,
                 ids=ids_batch,
                 runtime=consumer_runtime,
                 obs_offset=obs_offset,
@@ -407,7 +403,6 @@ def _process_psd_group(
                 psds,
                 freqs,
                 channel_names=channel_names,
-                channel_pooling=channel_pooling,
                 ids=ids_batch,
                 runtime=consumer_runtime,
                 obs_offset=obs_offset,
@@ -423,7 +418,6 @@ def _process_batch(
     X: np.ndarray,
     sfreq: float | None,
     channel_names: list[str] | None,
-    channel_pooling: str | dict[str, list[str]],
     ids: np.ndarray | None,
     signal_extractors: list[BaseDescriptorExtractor],
     psd_groups: list[_PSDGroup],
@@ -443,8 +437,6 @@ def _process_batch(
         Sampling frequency in Hertz.
     channel_names : list of str or None
         Runtime channel labels.
-    channel_pooling : {"none", "all"} or dict
-        Descriptor-level channel pooling policy.
     ids : np.ndarray or None
         Observation identifiers aligned with ``X``.
     signal_extractors : list of BaseDescriptorExtractor
@@ -475,7 +467,6 @@ def _process_batch(
                 X_batch,
                 sfreq=sfreq,
                 channel_names=channel_names,
-                channel_pooling=channel_pooling,
                 ids=ids_batch,
                 runtime=_sequential_runtime(runtime),
                 obs_offset=obs_offset,
@@ -488,7 +479,6 @@ def _process_batch(
                 X_batch,
                 sfreq=sfreq,
                 channel_names=channel_names,
-                channel_pooling=channel_pooling,
                 ids_batch=ids_batch,
                 runtime=_sequential_runtime(runtime),
                 obs_offset=obs_offset,
@@ -514,7 +504,6 @@ def _process_batch(
                 X_batch,
                 sfreq=sfreq,
                 channel_names=channel_names,
-                channel_pooling=channel_pooling,
                 ids=ids_batch,
                 runtime=signal_runtime,
                 obs_offset=obs_offset,
@@ -536,7 +525,6 @@ def _process_batch(
                     X_batch,
                     sfreq=sfreq,
                     channel_names=channel_names,
-                    channel_pooling=channel_pooling,
                     ids_batch=ids_batch,
                     runtime=runtime
                     if strategy == "parametric-inner" and group.needs_parametric_fit
@@ -606,6 +594,7 @@ class DescriptorPipeline:
         )
         corrected_outputs = {
             "corrected_absolute_power",
+            "corrected_log_absolute_power",
             "corrected_relative_power",
             "corrected_ratios",
         }
@@ -740,7 +729,6 @@ class DescriptorPipeline:
                     X=inputs["X"],
                     sfreq=inputs["sfreq"],
                     channel_names=inputs["channel_names"],
-                    channel_pooling=inputs["channel_pooling"],
                     ids=inputs["ids"],
                     signal_extractors=self.signal_extractors,
                     psd_groups=self.psd_groups,
@@ -761,7 +749,6 @@ class DescriptorPipeline:
                     X=inputs["X"],
                     sfreq=inputs["sfreq"],
                     channel_names=inputs["channel_names"],
-                    channel_pooling=inputs["channel_pooling"],
                     ids=inputs["ids"],
                     signal_extractors=self.signal_extractors,
                     psd_groups=self.psd_groups,
@@ -780,7 +767,7 @@ class DescriptorPipeline:
         X_desc, descriptor_names, failures = _merge_descriptor_blocks(
             blocks,
             n_obs=inputs["X"].shape[0],
-            precision=self.config.output.precision,
+            precision=self.config.precision,
         )
 
         if self.config.runtime.on_error == "warn" and failures:
@@ -793,4 +780,139 @@ class DescriptorPipeline:
             "X": X_desc,
             "descriptor_names": descriptor_names,
             "failures": failures,
+        }
+
+    def pool_channels(
+        self,
+        result: Mapping[str, Any],
+        channel_groups: Mapping[str, Sequence[str]],
+    ) -> dict[str, Any]:
+        """Pool sensor-level descriptor columns into grouped channel outputs.
+
+        Parameters
+        ----------
+        result : mapping
+            Standard descriptor result produced by :meth:`extract`.
+        channel_groups : mapping of str to sequence of str
+            Channel groups used to replace sensor-level descriptor columns with
+            grouped ``"chgrp-..."`` outputs.
+
+        Returns
+        -------
+        dict[str, Any]
+            Descriptor result with grouped channel features and unchanged
+            failures.
+
+        Raises
+        ------
+        ValueError
+            If the provided result is malformed or if any requested group
+            cannot be formed from the sensor-level descriptor columns.
+        """
+        if (
+            "X" not in result
+            or "descriptor_names" not in result
+            or "failures" not in result
+        ):
+            raise ValueError(
+                "pool_channels() expects a result mapping with keys "
+                "'X', 'descriptor_names', and 'failures'."
+            )
+
+        X_desc = np.asarray(result["X"], dtype=float)
+        descriptor_names = [str(name) for name in result["descriptor_names"]]
+        if X_desc.ndim != 2:
+            raise ValueError("pool_channels() expects result['X'] to be 2D.")
+        if X_desc.shape[1] != len(descriptor_names):
+            raise ValueError(
+                "pool_channels() requires result['descriptor_names'] to align with "
+                "result['X'] columns."
+            )
+        if not channel_groups:
+            raise ValueError("channel_groups must define at least one group.")
+
+        base_to_channel_cols: dict[str, dict[str, int]] = {}
+        known_channels: set[str] = set()
+        for col_idx, descriptor_name in enumerate(descriptor_names):
+            if "_ch-" not in descriptor_name:
+                continue
+            base_name, channel_name = descriptor_name.rsplit("_ch-", 1)
+            base_to_channel_cols.setdefault(base_name, {})[channel_name] = col_idx
+            known_channels.add(channel_name)
+
+        if not base_to_channel_cols:
+            raise ValueError(
+                "pool_channels() requires sensor-level descriptor names "
+                "ending in '_ch-<sensor>'."
+            )
+
+        normalized_groups: dict[str, list[str]] = {}
+        assigned: dict[str, str] = {}
+        for raw_group_name, raw_members in channel_groups.items():
+            group_name = str(raw_group_name)
+            if not group_name:
+                raise ValueError("channel_groups keys must be non-empty strings.")
+            members = [str(member) for member in raw_members]
+            if not members:
+                raise ValueError(
+                    f"channel_groups['{group_name}'] must define at least one channel."
+                )
+            if len(set(members)) != len(members):
+                raise ValueError(
+                    f"channel_groups['{group_name}'] must not contain duplicates."
+                )
+            for member in members:
+                if member not in known_channels:
+                    raise ValueError(
+                        f"channel_groups['{group_name}'] references unknown channel "
+                        f"'{member}'."
+                    )
+                if member in assigned:
+                    raise ValueError(
+                        f"Channel '{member}' is assigned to multiple channel_groups: "
+                        f"'{assigned[member]}' and '{group_name}'."
+                    )
+                assigned[member] = group_name
+            normalized_groups[group_name] = members
+
+        output_columns: list[np.ndarray] = []
+        pooled_names: list[str] = []
+        seen_bases: set[str] = set()
+        for col_idx, descriptor_name in enumerate(descriptor_names):
+            if "_ch-" not in descriptor_name:
+                output_columns.append(X_desc[:, col_idx][:, None])
+                pooled_names.append(descriptor_name)
+                continue
+
+            base_name, _ = descriptor_name.rsplit("_ch-", 1)
+            if base_name in seen_bases:
+                continue
+            seen_bases.add(base_name)
+
+            channel_to_col = base_to_channel_cols[base_name]
+            for group_name, members in normalized_groups.items():
+                missing = [member for member in members if member not in channel_to_col]
+                if missing:
+                    raise ValueError(
+                        "pool_channels() could not form group "
+                        f"'{group_name}' for descriptor base '{base_name}'. "
+                        f"Missing channels: {missing}."
+                    )
+                member_indices = [channel_to_col[member] for member in members]
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    grouped = np.nanmean(X_desc[:, member_indices], axis=1)
+                output_columns.append(grouped[:, None])
+                pooled_names.append(f"{base_name}_chgrp-{group_name}")
+
+        X_pooled = _cast_precision(
+            np.concatenate(output_columns, axis=1)
+            if output_columns
+            else np.empty((X_desc.shape[0], 0), dtype=float),
+            self.config.precision,
+        )
+        return {
+            "X": X_pooled,
+            "descriptor_names": pooled_names,
+            "failures": list(result["failures"]),
         }

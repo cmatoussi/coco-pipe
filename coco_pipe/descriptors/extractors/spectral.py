@@ -17,10 +17,11 @@ Within one extracted PSD batch, the family computes band integrals once and
 reuses them for all requested outputs:
 
 - absolute power
-- optional log absolute power
+- log absolute power
 - relative power
 - band ratios
 - corrected absolute power
+- corrected log absolute power
 - corrected relative power
 - corrected band ratios
 
@@ -40,8 +41,7 @@ import numpy as np
 from ..configs import BandDescriptorConfig
 from ._parametric_fit import _ParametricFitBatch
 from ._psd import compute_psd
-from .base import BasePSDDescriptorExtractor, _DescriptorBlock
-from .utils import make_failure_record
+from .base import BasePSDDescriptorExtractor, _DescriptorBlock, make_failure_record
 
 
 class BandDescriptorExtractor(BasePSDDescriptorExtractor):
@@ -69,8 +69,7 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
     Notes
     -----
     The extractor always computes descriptor values per sensor first. Public
-    output pooling, such as `channel_pooling="all"` or grouped channel pooling,
-    is applied afterward through
+    sensor-level naming is applied afterward through
     :meth:`BaseDescriptorExtractor._finalize_descriptor`.
 
     When the pipeline provides a precomputed PSD batch through
@@ -146,6 +145,7 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
             output
             in {
                 "corrected_absolute_power",
+                "corrected_log_absolute_power",
                 "corrected_relative_power",
                 "corrected_ratios",
             }
@@ -166,7 +166,6 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
         psds: np.ndarray,
         freqs: np.ndarray,
         channel_names: list[str] | None,
-        channel_pooling: str | dict[str, list[str]],
         ids: np.ndarray | None,
         runtime,
         obs_offset: int = 0,
@@ -185,9 +184,6 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
             Explicit channel labels aligned with axis 1 of ``psds``. If
             omitted, fallback names ``"ch-0"``, ``"ch-1"``, ... are used
             internally.
-        channel_pooling : {"none", "all"} or dict
-            Descriptor-level channel pooling policy applied after per-sensor
-            band values are computed.
         ids : np.ndarray, optional
             Observation identifiers aligned with axis 0 of ``psds``.
         runtime : DescriptorRuntimeConfig
@@ -215,16 +211,15 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
         The extractor first restricts the incoming PSD to the configured
         frequency window, then integrates one power value per configured band
         and sensor. Those band integrals are reused for all enabled outputs,
-        such as absolute power, relative power, log power, and ratios.
+        such as absolute power, log absolute power, relative power, and
+        ratios. Ratios are always derived from absolute band powers, not from
+        relative or log-transformed outputs.
 
-        Examples
-        --------
-        With ``channel_pooling="none"`` and
-        ``channel_names=["Fz", "Cz"]``, an absolute alpha-band request yields
-        names such as ``band_abs_alpha_ch-Fz`` and ``band_abs_alpha_ch-Cz``.
-
-        With ``channel_pooling="all"``, the same metric yields one pooled
-        column named ``band_abs_alpha_ch-all``.
+        Example
+        -------
+        With ``channel_names=["Fz", "Cz"]``, an absolute alpha-band request
+        yields names such as ``band_abs_alpha_ch-Fz`` and
+        ``band_abs_alpha_ch-Cz``.
         """
         channel_names = channel_names or [f"ch-{idx}" for idx in range(psds.shape[1])]
         eps = np.finfo(float).eps
@@ -302,6 +297,7 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
             missing_band_names: set[str],
             output_prefix: str | None,
             enabled_absolute_output: str,
+            enabled_log_output: str,
             enabled_relative_output: str,
             enabled_ratio_output: str,
             relative_message_prefix: str,
@@ -309,6 +305,7 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
             failed_pairs_to_skip: set[tuple[int, int]] | None = None,
         ) -> None:
             metric_prefix = [] if output_prefix is None else [output_prefix]
+            denominator_floor = self.config.min_denominator_power
 
             if enabled_absolute_output in self.config.outputs:
                 for band_name, values in band_power_dict.items():
@@ -317,24 +314,21 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
                         family_prefix="band",
                         metric_name="_".join(metric_prefix + ["abs", band_name]),
                         channel_names=channel_names,
-                        channel_pooling=channel_pooling,
                     )
                     chunk_features.append(feature)
                     descriptor_names.extend(names)
 
-                    if self.config.log_power:
-                        log_values = np.log10(np.clip(values, eps, None))
-                        feature, names = self._finalize_descriptor(
-                            log_values,
-                            family_prefix="band",
-                            metric_name="_".join(
-                                metric_prefix + ["log", "abs", band_name]
-                            ),
-                            channel_names=channel_names,
-                            channel_pooling=channel_pooling,
-                        )
-                        chunk_features.append(feature)
-                        descriptor_names.extend(names)
+            if enabled_log_output in self.config.outputs:
+                for band_name, values in band_power_dict.items():
+                    log_values = np.log10(np.clip(values, eps, None))
+                    feature, names = self._finalize_descriptor(
+                        log_values,
+                        family_prefix="band",
+                        metric_name="_".join(metric_prefix + ["log", "abs", band_name]),
+                        channel_names=channel_names,
+                    )
+                    chunk_features.append(feature)
+                    descriptor_names.extend(names)
 
             if enabled_relative_output in self.config.outputs:
                 for band_name, values in band_power_dict.items():
@@ -342,7 +336,7 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
                         values,
                         total_power_array,
                         out=np.full_like(values, np.nan, dtype=float),
-                        where=total_power_array > 0,
+                        where=total_power_array > denominator_floor,
                     )
                     if band_name not in missing_band_names:
                         for obs_rel, ch_idx in np.argwhere(~np.isfinite(relative)):
@@ -374,7 +368,6 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
                         family_prefix="band",
                         metric_name="_".join(metric_prefix + ["rel", band_name]),
                         channel_names=channel_names,
-                        channel_pooling=channel_pooling,
                     )
                     chunk_features.append(feature)
                     descriptor_names.extend(names)
@@ -389,7 +382,7 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
                             np.nan,
                             dtype=float,
                         ),
-                        where=band_power_dict[denominator] > 0,
+                        where=band_power_dict[denominator] > denominator_floor,
                     )
                     if (
                         numerator not in missing_band_names
@@ -427,7 +420,6 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
                             metric_prefix + ["ratio", numerator, denominator]
                         ),
                         channel_names=channel_names,
-                        channel_pooling=channel_pooling,
                     )
                     chunk_features.append(feature)
                     descriptor_names.extend(names)
@@ -491,6 +483,7 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
             missing_bands,
             None,
             "absolute_power",
+            "log_absolute_power",
             "relative_power",
             "ratios",
             "Relative power",
@@ -502,6 +495,7 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
             corrected_missing_bands,
             "corr",
             "corrected_absolute_power",
+            "corrected_log_absolute_power",
             "corrected_relative_power",
             "corrected_ratios",
             "Corrected relative power",
@@ -537,7 +531,6 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
         X: np.ndarray,
         sfreq: float | None,
         channel_names: list[str] | None,
-        channel_pooling: str | dict[str, list[str]],
         ids: np.ndarray | None,
         runtime,
         obs_offset: int = 0,
@@ -553,9 +546,6 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
             Sampling frequency in Hertz.
         channel_names : list of str, optional
             Explicit channel labels aligned with axis 1 of ``X``.
-        channel_pooling : {"none", "all"} or dict
-            Descriptor-level channel pooling policy applied after per-sensor
-            band values are computed.
         ids : np.ndarray, optional
             Observation identifiers aligned with axis 0 of ``X``.
         runtime : DescriptorRuntimeConfig
@@ -595,7 +585,6 @@ class BandDescriptorExtractor(BasePSDDescriptorExtractor):
             psds,
             freqs,
             channel_names=channel_names,
-            channel_pooling=channel_pooling,
             ids=ids,
             runtime=runtime,
             obs_offset=obs_offset,
