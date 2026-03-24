@@ -117,6 +117,13 @@ def main() -> None:
     pipe = DescriptorPipeline(descriptor_cfg)
     result = pipe.extract(**explicit_inputs)
 
+    channel_groups = payload.get("channel_groups")
+    if channel_groups == "all":
+        channel_groups = {"all": explicit_inputs["channel_names"]}
+
+    if channel_groups:
+        result = pipe.pool_channels(result, channel_groups)
+
     if save_path:
         _save_result(Path(save_path), result)
 

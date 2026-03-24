@@ -19,7 +19,6 @@ def main() -> None:
     ids = np.asarray([f"obs-{idx:02d}" for idx in range(12)])
 
     config = {
-        "output": {"channel_pooling": "all"},
         "families": {
             "bands": {
                 "enabled": True,
@@ -36,13 +35,17 @@ def main() -> None:
         },
     }
 
+    channels = ["Fz", "Cz", "Pz"]
     pipe = DescriptorPipeline(config)
     result = pipe.extract(
         X=X,
         ids=ids,
         sfreq=256.0,
-        channel_names=["Fz", "Cz", "Pz"],
+        channel_names=channels,
     )
+
+    # Apply pooling after extraction
+    result = pipe.pool_channels(result, {"all": channels})
 
     print("Descriptor matrix shape:", result["X"].shape)
     print("First five names:", result["descriptor_names"][:5])

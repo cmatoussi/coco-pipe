@@ -26,9 +26,7 @@ descriptors:
   input:
     require_sfreq: true
     require_channel_names: false
-  output:
   precision: float32
-  channel_pooling: all
   include_failure_summary: true
   include_runtime_meta: true
   families:
@@ -68,3 +66,4 @@ descriptors:
     on_error: collect
 
 save_path: outputs/descriptors_eeg.npz
+channel_groups: all
