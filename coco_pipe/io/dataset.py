@@ -689,7 +689,7 @@ class BIDSDataset(BaseDataset):
                             stem_parts.append(f"run-{run}")
 
                         pre_epoched_suffix = self.suffix or "epo"
-                        stem = "_".join(stem_parts)
+                        stem = "*_".join(stem_parts)
                         matches = sorted(
                             pre_epoched_dir.glob(f"{stem}*_{pre_epoched_suffix}.fif")
                         )
