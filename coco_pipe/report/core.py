@@ -8,6 +8,7 @@ to assemble single-file HTML reports.
 
 import base64
 import gzip
+import html
 import io
 import json
 import re
@@ -342,22 +343,22 @@ class TableElement(Element):
         self.title = title
         self.table_id = f"table-{uuid.uuid4().hex[:8]}"
 
-    def render(self) -> str:
-        # Convert to DataFrame
-        if isinstance(self.data, pd.DataFrame):
-            df = self.data
-        elif isinstance(self.data, dict):
-            # Check if all values are scalars
-            # (to avoid "If using all scalar values, you must pass an index")
+    @staticmethod
+    def _to_frame(data: Any) -> pd.DataFrame:
+        """Normalize supported table-like inputs to a DataFrame."""
+        if isinstance(data, pd.DataFrame):
+            return data
+        if isinstance(data, dict):
             if all(
                 isinstance(v, (int, float, str, np.number)) or v is None
-                for v in self.data.values()
+                for v in data.values()
             ):
-                df = pd.DataFrame([self.data])
-            else:
-                df = pd.DataFrame(self.data)
-        else:
-            df = pd.DataFrame(self.data)
+                return pd.DataFrame([data])
+            return pd.DataFrame(data)
+        return pd.DataFrame(data)
+
+    def render(self) -> str:
+        df = self._to_frame(self.data)
 
         # Basic Tailwind Styling
         html = '<div class="overflow-x-auto my-4 group relative">'
@@ -417,6 +418,72 @@ class TableElement(Element):
             )
         html += "</tr>"
         return html
+
+
+class InteractiveTableElement(Element):
+    """Render a payload-backed interactive data table."""
+
+    def __init__(
+        self,
+        data: Any,
+        title: Optional[str] = None,
+        selector_columns: Optional[List[str]] = None,
+        default_sort: Optional[Dict[str, str]] = None,
+        page_size: int = 50,
+    ):
+        self.data = data
+        self.title = title
+        self.selector_columns = list(selector_columns or [])
+        self.default_sort = dict(default_sort) if default_sort else None
+        self.page_size = int(page_size)
+        self.registry_id: Optional[str] = None
+
+    def collect_payload(self, registry: Dict[str, Any]) -> None:
+        if self.registry_id is None:
+            self.registry_id = str(uuid.uuid4())
+
+        df = TableElement._to_frame(self.data)
+        payload = {
+            "columns": [str(column) for column in df.columns],
+            "rows": json.loads(df.to_json(orient="records", date_format="iso")),
+        }
+        registry[self.registry_id] = payload
+
+    def render(self) -> str:
+        if self.registry_id is None:
+            self.registry_id = str(uuid.uuid4())
+
+        config = {
+            "title": self.title,
+            "selector_columns": self.selector_columns,
+            "default_sort": self.default_sort,
+            "page_size": self.page_size,
+        }
+        config_json = html.escape(json.dumps(config), quote=True)
+        title_html = ""
+        if self.title:
+            title_html = f"""
+            <div class="flex justify-between items-center mb-3">
+                <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300
+                    uppercase tracking-wide">
+                    {self.title}
+                </h4>
+            </div>
+            """
+
+        return f"""
+        <div class="my-4">
+            {title_html}
+            <div class="interactive-table" data-id="{self.registry_id}"
+                 data-config="{config_json}">
+                <div class="rounded border border-gray-200 dark:border-gray-700
+                            bg-white dark:bg-gray-900 p-4 text-sm text-gray-500
+                            dark:text-gray-400">
+                    Loading interactive table...
+                </div>
+            </div>
+        </div>
+        """
 
 
 class MetricsTableElement(TableElement):

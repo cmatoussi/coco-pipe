@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, clone
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -39,6 +40,8 @@ from sklearn.model_selection import (
     StratifiedKFold,
     train_test_split,
 )
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 from .configs import CVConfig
 
@@ -262,3 +265,79 @@ def get_scorer(name: str) -> Callable:
             f"Unknown metric '{name}'. Available: {sorted(list(metrics.keys()))}"
         )
     return metrics[name]
+
+
+def cross_validate_score(
+    estimator: BaseEstimator,
+    X: np.ndarray,
+    y: Sequence,
+    *,
+    groups: Optional[Sequence] = None,
+    cv_config: Optional[CVConfig] = None,
+    metric: str = "balanced_accuracy",
+    use_scaler: bool = False,
+) -> float:
+    """
+    Compute one mean cross-validated score for an estimator.
+
+    Parameters
+    ----------
+    estimator : BaseEstimator
+        Estimator to fit inside each fold.
+    X : np.ndarray
+        Input features with shape ``(n_samples, n_features)``.
+    y : sequence
+        Target labels aligned with ``X``.
+    groups : sequence, optional
+        Group labels aligned with ``X``.
+    cv_config : CVConfig, optional
+        Cross-validation configuration. Defaults to a 5-fold stratified
+        strategy, or 5-fold stratified-group strategy when groups are
+        provided.
+    metric : str, default="balanced_accuracy"
+        Metric name resolved through :func:`get_scorer`.
+    use_scaler : bool, default=False
+        When ``True``, wraps the estimator in a ``StandardScaler`` pipeline.
+
+    Returns
+    -------
+    float
+        Mean cross-validated score.
+    """
+    X = np.asarray(X)
+    y = np.asarray(y).reshape(-1)
+    if len(X) != len(y):
+        raise ValueError("X and y must have matching sample counts.")
+
+    group_values = None
+    if groups is not None:
+        group_values = np.asarray(groups).reshape(-1)
+        if len(group_values) != len(y):
+            raise ValueError("groups must align with X and y.")
+
+    if cv_config is None:
+        cv_config = CVConfig(
+            strategy="stratified_group_kfold"
+            if group_values is not None
+            else "stratified",
+            n_splits=5,
+            shuffle=True,
+            random_state=42,
+        )
+
+    scorer = get_scorer(metric)
+    cv = get_cv_splitter(cv_config, groups=group_values)
+    base_estimator = estimator
+    if use_scaler:
+        base_estimator = Pipeline(
+            [("scaler", StandardScaler()), ("clf", clone(estimator))]
+        )
+
+    scores = []
+    for train_idx, test_idx in cv.split(X, y, group_values):
+        model = clone(base_estimator)
+        model.fit(X[train_idx], y[train_idx])
+        y_pred = model.predict(X[test_idx])
+        scores.append(float(scorer(y[test_idx], y_pred)))
+
+    return float(np.nanmean(scores)) if scores else float("nan")

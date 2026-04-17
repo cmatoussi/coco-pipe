@@ -36,10 +36,13 @@ from typing import (
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 
 if TYPE_CHECKING:
     from ..core import DimReduction
 
+from ...decoding.configs import CVConfig
+from ...decoding.utils import cross_validate_score
 from .geometry import (
     trajectory_acceleration,
     trajectory_curvature,
@@ -63,6 +66,7 @@ from .metrics import (
 __all__ = ["evaluate_embedding", "MethodSelector"]
 
 METRIC_COLUMNS = ("method", "metric", "value", "scope", "scope_value")
+SEPARATION_LOGREG_BALANCED_ACCURACY = "separation_logreg_balanced_accuracy"
 SWEEP_METRICS = (
     "trustworthiness",
     "continuity",
@@ -90,6 +94,7 @@ RANKING_DIRECTIONS = {
     "continuity": "desc",
     "lcmc": "desc",
     "shepard_correlation": "desc",
+    SEPARATION_LOGREG_BALANCED_ACCURACY: "desc",
     "mrre_intrusion": "asc",
     "mrre_extrusion": "asc",
     "mrre_total": "asc",
@@ -441,6 +446,7 @@ def evaluate_embedding(
     method_name: str = "embedding",
     metrics: Optional[Sequence[str]] = None,
     labels: Optional[np.ndarray] = None,
+    groups: Optional[np.ndarray] = None,
     times: Optional[np.ndarray] = None,
     quality_metadata: Optional[Dict[str, Any]] = None,
     diagnostics: Optional[Dict[str, Any]] = None,
@@ -469,8 +475,13 @@ def evaluate_embedding(
         Metric selectors to compute. ``None`` computes all metrics available for
         the provided inputs.
     labels : np.ndarray, optional
-        Optional trajectory labels used by ``trajectory_separation`` for native
-        3D embeddings.
+        Optional labels aligned with the embedding. Used by
+        ``trajectory_separation`` for native 3D embeddings and by explicit
+        supervised 2D metrics such as
+        ``separation_logreg_balanced_accuracy`` when requested.
+    groups : np.ndarray, optional
+        Optional grouping variable aligned with ``X_emb``. Required by
+        ``separation_logreg_balanced_accuracy``.
     times : np.ndarray, optional
         Optional trajectory time coordinates used for separation AUC
         integration when trajectory metrics are evaluated.
@@ -552,6 +563,7 @@ def evaluate_embedding(
     metric_selection = None if metrics is None else set(metrics)
 
     standard_metric_names = set(SWEEP_METRICS) | {"shepard_correlation"}
+    supervised_metric_names = {SEPARATION_LOGREG_BALANCED_ACCURACY}
     trajectory_metric_names = set(DEFAULT_SCORE_METRICS) - standard_metric_names
 
     metrics_payload: Dict[str, Any] = {}
@@ -572,11 +584,13 @@ def evaluate_embedding(
 
     if X_emb.ndim == 2:
         if metric_selection is None:
-            metric_selection = standard_metric_names
+            standard_selection = standard_metric_names
+            supervised_selection = set()
         else:
-            metric_selection = metric_selection & standard_metric_names
+            standard_selection = metric_selection & standard_metric_names
+            supervised_selection = metric_selection & supervised_metric_names
 
-        if metric_selection:
+        if standard_selection:
             if X is None:
                 raise ValueError(
                     "Original data `X` is required to evaluate standard metrics "
@@ -592,7 +606,7 @@ def evaluate_embedding(
                 method_name=method_name,
                 X_eval=X,
                 X_emb_eval=X_emb,
-                metric_selection=metric_selection,
+                metric_selection=standard_selection,
                 n_neighbors=n_neighbors,
                 k_values=k_values,
                 random_state=random_state,
@@ -600,6 +614,36 @@ def evaluate_embedding(
             metrics_payload.update(std_metrics)
             diagnostics_payload.update(std_diagnostics)
             records.extend(std_records)
+        if SEPARATION_LOGREG_BALANCED_ACCURACY in supervised_selection:
+            if labels is None or groups is None:
+                raise ValueError(
+                    f"`labels` and `groups` are required for "
+                    f"'{SEPARATION_LOGREG_BALANCED_ACCURACY}'."
+                )
+            separation_score = cross_validate_score(
+                LogisticRegression(max_iter=1000, class_weight="balanced"),
+                X_emb,
+                labels,
+                groups=groups,
+                cv_config=CVConfig(
+                    strategy="stratified_group_kfold",
+                    n_splits=5,
+                    shuffle=True,
+                    random_state=42,
+                ),
+                metric="balanced_accuracy",
+                use_scaler=True,
+            )
+            metrics_payload[SEPARATION_LOGREG_BALANCED_ACCURACY] = separation_score
+            records.append(
+                {
+                    "method": method_name,
+                    "metric": SEPARATION_LOGREG_BALANCED_ACCURACY,
+                    "value": separation_score,
+                    "scope": "global",
+                    "scope_value": "global",
+                }
+            )
     elif X_emb.ndim == 3:
         if metric_selection is None:
             metric_selection = trajectory_metric_names
@@ -718,6 +762,18 @@ class MethodSelector:
                     )
 
         self.metric_records_ = []
+
+    @classmethod
+    def from_records(cls, records: List[Dict[str, Any]]) -> "MethodSelector":
+        """Create a selector directly from long-form metric records."""
+        selector = cls({})
+        selector.metric_records_ = [dict(record) for record in records]
+        return selector
+
+    @classmethod
+    def from_frame(cls, frame: pd.DataFrame) -> "MethodSelector":
+        """Create a selector directly from a metric-record DataFrame."""
+        return cls.from_records(frame.to_dict(orient="records"))
 
     def collect(self) -> "MethodSelector":
         """

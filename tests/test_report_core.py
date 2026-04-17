@@ -8,6 +8,7 @@ import pytest
 from coco_pipe.report.core import (
     HtmlElement,
     ImageElement,
+    InteractiveTableElement,
     MetricsTableElement,
     PlotlyElement,
     Report,
@@ -126,6 +127,47 @@ def test_table_element_dict_inputs():
     el_non_scalar = TableElement({"A": [1, 2], "B": [3, 4]})
     assert "A" in el_non_scalar.render()
     assert "2" in el_non_scalar.render()
+
+
+def test_interactive_table_element_payload_and_render(tmp_report_file):
+    df = pd.DataFrame(
+        {
+            "eval_name": ["epilepsy", "adhd"],
+            "reducer": ["PCA", "UMAP"],
+            "score": [0.71, 0.82],
+        }
+    )
+    element = InteractiveTableElement(
+        df,
+        title="Interactive Metrics",
+        selector_columns=["eval_name", "reducer"],
+        default_sort={"column": "score", "direction": "desc"},
+        page_size=25,
+    )
+
+    registry = {}
+    element.collect_payload(registry)
+    assert len(registry) == 1
+    payload = next(iter(registry.values()))
+    assert payload["columns"] == ["eval_name", "reducer", "score"]
+    assert len(payload["rows"]) == 2
+
+    html = element.render()
+    assert 'class="interactive-table"' in html
+    assert 'data-id="' in html
+    assert 'data-config="' in html
+
+    report = Report(title="Interactive Table Report")
+    report.add_element(element)
+    report.save(str(tmp_report_file))
+    content = tmp_report_file.read_text(encoding="utf-8")
+    assert "interactive-table" in content
+    assert "initInteractiveTables" in content
+    assert "data-table-search" in content
+    assert "data-sort-column" in content
+    assert "data-selector-column" in content
+    assert "data-export-table" in content
+    assert "data-page-size" in content
 
 
 def test_metrics_table_highlighting():
