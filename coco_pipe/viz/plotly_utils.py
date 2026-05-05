@@ -267,12 +267,14 @@ def _marker_payload(
     if is_categorical(values):
         if hasattr(values, "cat"):
             categories = values.cat.categories.tolist()
+            lookup_values = values.astype(str)
         else:
             categories = sorted(
                 pd.Series(values).dropna().astype(str).unique().tolist()
             )
+            lookup_values = pd.Series(values).astype(str)
         cat_map = {cat: i for i, cat in enumerate(categories)}
-        mapped = [cat_map.get(v, np.nan) for v in values]
+        mapped = [cat_map.get(v, np.nan) for v in lookup_values]
         _, colorscale = _discrete_colorscale(categories, palette=palette)
         payload = {
             "color": mapped,

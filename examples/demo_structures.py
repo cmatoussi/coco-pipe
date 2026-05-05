@@ -85,7 +85,7 @@ print(f"Sample Composite Features: {flat_ml.coords['feature'][:5]}")
 # just globally by condition.
 # Let's say we group by 'y' (Conditions A, B)
 print("\n--- Aggregation Test ---")
-agg_cond = container_eeg.aggregate(by=container_eeg.y, method="mean")
+agg_cond = container_eeg.aggregate(by=container_eeg.y, stats="mean")
 print(f"Aggregated by Condition (A, B): {agg_cond.shape} ids={agg_cond.ids}")
 
 # Test Selection of Specific Epochs (Wildcard)

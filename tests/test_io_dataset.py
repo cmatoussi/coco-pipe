@@ -236,7 +236,7 @@ def test_bids_dataset_mismatches(monkeypatch, tmp_path):
     monkeypatch.setattr(
         dataset,
         "_get_bids_path",
-        lambda: (lambda **k: types.SimpleNamespace(match=lambda: [], **k)),
+        lambda: lambda **k: types.SimpleNamespace(match=lambda: [], **k),
     )
 
     # One subject, two sessions

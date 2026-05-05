@@ -97,6 +97,11 @@ eeg = [
     "mne-bids>=0.10.0",
     "meegkit",
 ]
+descriptors = [
+    "specparam",
+    "antropy",
+    "neurokit2",
+]
 dim-red = [
     "dask[array]",
     "dask-ml",
@@ -134,6 +139,9 @@ full = [
     "meegkit",
     "mne>=1.9.0",
     "mne-bids>=0.10.0",
+    "specparam",
+    "antropy",
+    "neurokit2",
 ]
 
 [project.urls]

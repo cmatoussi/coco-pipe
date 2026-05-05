@@ -359,7 +359,12 @@ def detect_runs(
     Detect available runs for a given subject/session/task.
     """
     bp = _get_bids_path()(
-        root=root, subject=subject, session=session, task=task, datatype=datatype
+        root=root,
+        subject=subject,
+        session=session,
+        task=task,
+        datatype=datatype,
+        check=False,
     )
     matches = bp.match()
     runs = set()

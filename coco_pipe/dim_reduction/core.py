@@ -278,6 +278,7 @@ class DimReduction:
         metrics: Optional[List[str]] = None,
         k_values: Optional[List[int]] = None,
         labels: Optional[np.ndarray] = None,
+        groups: Optional[np.ndarray] = None,
         times: Optional[np.ndarray] = None,
         separation_method: str = "centroid",
     ) -> Dict[str, Dict[str, Any]]:
@@ -301,7 +302,12 @@ class DimReduction:
             Neighborhood sizes used for multi-scale standard metric evaluation.
         labels : np.ndarray, optional
             Optional labels aligned with the embedding. Used for trajectory
-            separation when ``X_emb`` is 3D.
+            separation when ``X_emb`` is 3D and for explicit supervised 2D
+            metrics when requested.
+        groups : np.ndarray, optional
+            Optional grouping variable aligned with the embedding. Required by
+            grouped supervised evaluation metrics such as
+            ``separation_logreg_balanced_accuracy``.
         times : np.ndarray, optional
             Optional trajectory time coordinates aligned with the trajectory
             length axis.
@@ -327,6 +333,7 @@ class DimReduction:
             method_name=self.method,
             metrics=metrics,
             labels=labels,
+            groups=groups,
             times=times,
             quality_metadata=self.get_quality_metadata(),
             diagnostics=self.get_diagnostics(),

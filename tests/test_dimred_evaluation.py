@@ -29,6 +29,10 @@ from coco_pipe.dim_reduction.evaluation import (
     trajectory_turning_angle,
     trustworthiness,
 )
+from coco_pipe.dim_reduction.evaluation.core import (
+    SEPARATION_LOGREG_BALANCED_ACCURACY,
+    evaluate_embedding,
+)
 from coco_pipe.viz.dim_reduction import plot_metrics
 
 
@@ -111,6 +115,116 @@ def test_method_selector_to_frame(data):
     )
     assert set(metrics_df["scope"]) == {"k"}
     assert set(metrics_df["method"]) == {"PCA"}
+
+
+def test_evaluate_embedding_supervised_metric_records():
+    rng = np.random.RandomState(42)
+    group_labels = np.array([0] * 10 + [1] * 10)
+    group_features = rng.normal(
+        loc=group_labels[:, None] * 3.0, scale=0.4, size=(20, 6)
+    )
+    X = np.repeat(group_features, 2, axis=0) + rng.normal(scale=0.1, size=(40, 6))
+    y = np.repeat(group_labels, 2)
+    groups = np.repeat(np.arange(20), 2)
+    X_emb = X[:, :2]
+
+    payload = evaluate_embedding(
+        X_emb,
+        metrics=[SEPARATION_LOGREG_BALANCED_ACCURACY],
+        labels=y,
+        groups=groups,
+    )
+
+    assert SEPARATION_LOGREG_BALANCED_ACCURACY in payload["metrics"]
+    records = pd.DataFrame.from_records(payload["records"])
+    assert not records.empty
+    assert records.iloc[0]["metric"] == SEPARATION_LOGREG_BALANCED_ACCURACY
+    assert records.iloc[0]["scope"] == "global"
+    assert records.iloc[0]["scope_value"] == "global"
+
+
+def test_evaluate_embedding_supervised_metric_requires_labels_and_groups():
+    X_emb = np.random.rand(12, 2)
+    y = np.array([0, 1] * 6)
+    groups = np.repeat(np.arange(6), 2)
+
+    with pytest.raises(ValueError, match="labels` and `groups` are required"):
+        evaluate_embedding(
+            X_emb,
+            metrics=[SEPARATION_LOGREG_BALANCED_ACCURACY],
+            labels=y,
+        )
+
+    with pytest.raises(ValueError, match="labels` and `groups` are required"):
+        evaluate_embedding(
+            X_emb,
+            metrics=[SEPARATION_LOGREG_BALANCED_ACCURACY],
+            groups=groups,
+        )
+
+
+def test_dim_reduction_score_supports_grouped_supervised_metric():
+    rng = np.random.RandomState(7)
+    group_labels = np.array([0] * 8 + [1] * 8)
+    group_features = rng.normal(
+        loc=group_labels[:, None] * 2.5, scale=0.5, size=(16, 5)
+    )
+    X = np.repeat(group_features, 2, axis=0) + rng.normal(scale=0.05, size=(32, 5))
+    y = np.repeat(group_labels, 2)
+    groups = np.repeat(np.arange(16), 2)
+
+    reducer = DimReduction("PCA", n_components=2)
+    X_emb = reducer.fit_transform(X)
+    scores = reducer.score(
+        X_emb,
+        metrics=[SEPARATION_LOGREG_BALANCED_ACCURACY],
+        labels=y,
+        groups=groups,
+    )
+
+    assert SEPARATION_LOGREG_BALANCED_ACCURACY in scores["metrics"]
+    assert any(
+        record["metric"] == SEPARATION_LOGREG_BALANCED_ACCURACY
+        for record in reducer.metric_records_
+    )
+
+
+def test_method_selector_from_records_and_frame_preserve_extra_columns():
+    records = [
+        {
+            "method": "PCA",
+            "metric": SEPARATION_LOGREG_BALANCED_ACCURACY,
+            "value": 0.72,
+            "scope": "global",
+            "scope_value": "global",
+            "fit_id": "fit-a",
+            "eval_name": "epilepsy",
+        },
+        {
+            "method": "UMAP",
+            "metric": SEPARATION_LOGREG_BALANCED_ACCURACY,
+            "value": 0.84,
+            "scope": "global",
+            "scope_value": "global",
+            "fit_id": "fit-a",
+            "eval_name": "epilepsy",
+        },
+    ]
+
+    selector = MethodSelector.from_records(records)
+    frame = selector.to_frame()
+    assert {"fit_id", "eval_name"} <= set(frame.columns)
+
+    ranked = selector.rank_methods(SEPARATION_LOGREG_BALANCED_ACCURACY)
+    assert ranked.iloc[0]["method"] == "UMAP"
+
+    selector_from_frame = MethodSelector.from_frame(frame)
+    frame_roundtrip = selector_from_frame.to_frame()
+    assert {"fit_id", "eval_name"} <= set(frame_roundtrip.columns)
+    ranked_roundtrip = selector_from_frame.rank_methods(
+        SEPARATION_LOGREG_BALANCED_ACCURACY
+    )
+    assert ranked_roundtrip.iloc[0]["method"] == "UMAP"
 
 
 def test_velocity_fields(linear_data):
@@ -1268,3 +1382,43 @@ def test_method_selector_rank_methods_missing_records():
     selector = MethodSelector([])
     with pytest.raises(ValueError, match="No evaluation metrics available"):
         selector.rank_methods(selection_metric="trustworthiness")
+
+
+def test_evaluate_embedding_k_normalization_skip():
+    """Test skipping of k-metrics when normalizer is non-positive."""
+    X = np.random.rand(10, 5)
+    X_emb = X[:, :2]
+    # For n_samples=10, 2*n_samples - 3*k - 1 <= 0 means 20 - 3*k - 1 <= 0
+    # => 19 <= 3*k => k >= 7
+    # trustworthiness requires (2*n_samples - 3*k - 1) > 0
+    result = evaluate_embedding(
+        X_emb,
+        X=X,
+        metrics=["trustworthiness"],
+        k_values=[7],
+    )
+    # The metric should be skipped, so it shouldn't be in result['metrics']
+    assert "trustworthiness" not in result["metrics"]
+
+
+def test_evaluate_embedding_default_metrics_selection():
+    """Test default metric selection."""
+    X = np.random.rand(20, 5)
+    X_emb = X[:, :2]
+    # Calling with metrics=None (default) should trigger the standard selection
+    result = evaluate_embedding(X_emb, X=X, metrics=None)
+    assert "trustworthiness" in result["metrics"]
+    assert SEPARATION_LOGREG_BALANCED_ACCURACY not in result["metrics"]
+
+
+def test_method_selector_init_dict_invalid_type():
+    """Test MethodSelector initialization with dict and invalid reducer type."""
+    with pytest.raises(TypeError, match="only accepts scored DimReduction objects"):
+        MethodSelector({"pca": "not a reducer"})
+
+
+def test_evaluate_embedding_invalid_dim():
+    """Test evaluate_embedding with invalid X_emb dimensionality."""
+    X_emb = np.random.rand(10, 2, 2, 2)
+    with pytest.raises(ValueError, match="must be either 2D or 3D"):
+        evaluate_embedding(X_emb)
