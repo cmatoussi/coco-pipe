@@ -18,7 +18,7 @@ classifiers = [
 dependencies = [
     "numpy>=2.0.0",
     "pandas",
-    "scikit-learn",
+    "scikit-learn>1.6",
     "matplotlib",
     "seaborn",
     "scipy",
@@ -149,9 +149,6 @@ Homepage = "https://github.com/BabaSanfour/coco-pipe"
 Documentation = "https://cocopipe.readthedocs.io/"
 Repository = "https://github.com/BabaSanfour/coco-pipe.git"
 
-[project.scripts]
-run-coco-pipe = "scripts.run_ml:main"
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["coco_pipe*", "scripts*"]
@@ -161,7 +158,7 @@ include = ["coco_pipe*", "scripts*"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-ra -q --ignore-glob=tests/test_ml_*.py"
+addopts = "-ra -q"
 testpaths = [
     "tests",
 ]

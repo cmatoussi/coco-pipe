@@ -21,9 +21,6 @@ class BaseEstimatorConfig(BaseModel):
     """Base configuration for any estimator."""
 
     model_config = ConfigDict(extra="forbid")
-    random_state: Optional[int] = Field(
-        42, description="Random seed for reproducibility."
-    )
 
 
 # --- Mixins ---
@@ -37,14 +34,17 @@ class LinearMixin(BaseModel):
     n_jobs: Optional[int] = None
 
 
-class RegularizedLinearMixin(LinearMixin):
+class RegularizedLinearMixin(BaseModel):
     """Parameters for regularized linear models."""
 
+    fit_intercept: bool = True
+    copy_X: bool = True
     tol: float = 1e-3
     max_iter: Optional[int] = None
-    solver: str = "auto"
-    warm_start: bool = False
     positive: bool = False
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class TreeMixin(BaseModel):
@@ -60,6 +60,9 @@ class TreeMixin(BaseModel):
     min_impurity_decrease: float = 0.0
     ccp_alpha: float = 0.0
     n_jobs: Optional[int] = None
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
     verbose: int = 0
     warm_start: bool = False
 
@@ -81,7 +84,7 @@ class SupportVectorMixin(BaseModel):
 
 class SGDMixin(BaseModel):
     loss: str = "hinge"
-    penalty: Literal["l2", "l1", "elasticnet", "null"] = "l2"
+    penalty: Optional[Literal["l2", "l1", "elasticnet"]] = "l2"
     alpha: float = 0.0001
     l1_ratio: float = 0.15
     fit_intercept: bool = True
@@ -99,6 +102,9 @@ class SGDMixin(BaseModel):
     n_iter_no_change: int = 5
     warm_start: bool = False
     average: bool = False
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 # --- Classifiers ---
@@ -106,7 +112,7 @@ class SGDMixin(BaseModel):
 
 class LogisticRegressionConfig(BaseEstimatorConfig):
     method: Literal["LogisticRegression"] = "LogisticRegression"
-    penalty: Literal["l1", "l2", "elasticnet", "none", None] = "l2"
+    penalty: Literal["l1", "l2", "elasticnet", None] = "l2"
     dual: bool = False
     tol: float = 1e-4
     C: float = Field(1.0, gt=0.0)
@@ -115,11 +121,13 @@ class LogisticRegressionConfig(BaseEstimatorConfig):
     class_weight: Optional[Union[Dict, str]] = None
     solver: Literal["newton-cg", "lbfgs", "liblinear", "sag", "saga"] = "lbfgs"
     max_iter: int = 100
-    multiclass: Literal["auto", "ovr", "multinomial"] = "auto"
     verbose: int = 0
     warm_start: bool = False
     n_jobs: Optional[int] = None
     l1_ratio: Optional[float] = None
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class RandomForestClassifierConfig(BaseEstimatorConfig, TreeMixin):
@@ -137,6 +145,9 @@ class SVCConfig(BaseEstimatorConfig, SupportVectorMixin):
     class_weight: Optional[Union[Dict, str]] = None
     decision_function_shape: Literal["ovo", "ovr"] = "ovr"
     break_ties: bool = False
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class KNeighborsClassifierConfig(BaseEstimatorConfig):
@@ -172,6 +183,9 @@ class GradientBoostingClassifierConfig(BaseEstimatorConfig):
     n_iter_no_change: Optional[int] = None
     tol: float = 1e-4
     ccp_alpha: float = 0.0
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class SGDClassifierConfig(BaseEstimatorConfig, SGDMixin):
@@ -203,6 +217,9 @@ class MLPClassifierConfig(BaseEstimatorConfig):
     epsilon: float = 1e-8
     n_iter_no_change: int = 10
     max_fun: int = 15000
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class GaussianNBConfig(BaseEstimatorConfig):
@@ -225,13 +242,18 @@ class AdaBoostClassifierConfig(BaseEstimatorConfig):
     method: Literal["AdaBoostClassifier"] = "AdaBoostClassifier"
     n_estimators: int = 50
     learning_rate: float = 1.0
-    algorithm: Literal["SAMME", "SAMME.R"] = "SAMME.R"
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class DummyClassifierConfig(BaseEstimatorConfig):
     method: Literal["DummyClassifier"] = "DummyClassifier"
     strategy: Literal["stratified", "most_frequent", "prior", "uniform"] = "prior"
     constant: Optional[Any] = None
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 # --- Deep Learning / Foundation Models ---
@@ -314,6 +336,7 @@ class RidgeConfig(BaseEstimatorConfig, RegularizedLinearMixin):
     alpha: float = 1.0
     fit_intercept: bool = True
     copy_X: bool = True
+    solver: str = "auto"
 
 
 class LassoConfig(BaseEstimatorConfig, RegularizedLinearMixin):
@@ -323,6 +346,7 @@ class LassoConfig(BaseEstimatorConfig, RegularizedLinearMixin):
     fit_intercept: bool = True
     copy_X: bool = True
     selection: Literal["cyclic", "random"] = "cyclic"
+    warm_start: bool = False
 
 
 class ElasticNetConfig(BaseEstimatorConfig, RegularizedLinearMixin):
@@ -333,6 +357,7 @@ class ElasticNetConfig(BaseEstimatorConfig, RegularizedLinearMixin):
     fit_intercept: bool = True
     copy_X: bool = True
     selection: Literal["cyclic", "random"] = "cyclic"
+    warm_start: bool = False
 
 
 class RandomForestRegressorConfig(BaseEstimatorConfig, TreeMixin):
@@ -374,6 +399,9 @@ class GradientBoostingRegressorConfig(BaseEstimatorConfig):
     n_iter_no_change: Optional[int] = None
     tol: float = 1e-4
     ccp_alpha: float = 0.0
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class SGDRegressorConfig(BaseEstimatorConfig, SGDMixin):
@@ -404,6 +432,9 @@ class MLPRegressorConfig(BaseEstimatorConfig):
     epsilon: float = 1e-8
     n_iter_no_change: int = 10
     max_fun: int = 15000
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class DummyRegressorConfig(BaseEstimatorConfig):
@@ -479,11 +510,14 @@ class AdaBoostRegressorConfig(BaseEstimatorConfig):
     n_estimators: int = 50
     learning_rate: float = 1.0
     loss: Literal["linear", "square", "exponential"] = "linear"
+    random_state: Optional[int] = Field(
+        42, description="Random seed for reproducibility."
+    )
 
 
 class BayesianRidgeConfig(BaseEstimatorConfig):
     method: Literal["BayesianRidge"] = "BayesianRidge"
-    n_iter: int = 300
+    max_iter: int = 300
     tol: float = 1e-3
     alpha_1: float = 1e-6
     alpha_2: float = 1e-6
@@ -499,7 +533,7 @@ class BayesianRidgeConfig(BaseEstimatorConfig):
 
 class ARDRegressionConfig(BaseEstimatorConfig):
     method: Literal["ARDRegression"] = "ARDRegression"
-    n_iter: int = 300
+    max_iter: int = 300
     tol: float = 1e-3
     alpha_1: float = 1e-6
     alpha_2: float = 1e-6
@@ -528,8 +562,6 @@ AtomicEstimator = Union[
     LDAConfig,
     AdaBoostClassifierConfig,
     DummyClassifierConfig,
-    LPFTConfig,
-    SkorchClassifierConfig,
     # Regressors
     LinearRegressionConfig,
     RidgeConfig,
@@ -577,13 +609,19 @@ class CVConfig(BaseModel):
         "group_kfold",
         "stratified_group_kfold",
         "leave_p_out",
-        "leave_one_out",
+        "leave_one_group_out",
         "timeseries",
         "split",
     ] = "stratified"
     n_splits: int = Field(5, ge=2)
     shuffle: bool = True
     random_state: int = 42
+    test_size: float = Field(
+        0.2, gt=0.0, lt=1.0, description="Holdout size for strategy='split'."
+    )
+    stratify: bool = Field(
+        False, description="Whether strategy='split' should stratify by y."
+    )
 
 
 class TuningConfig(BaseModel):
@@ -598,16 +636,24 @@ class TuningConfig(BaseModel):
     n_iter: int = Field(10, description="Number of iterations for random search")
     scoring: Optional[str] = None  # Metric to optimize (defaults to first in list)
     n_jobs: int = -1
+    random_state: Optional[int] = Field(
+        42, description="Random seed used by RandomizedSearchCV."
+    )
+    cv: Optional[CVConfig] = Field(
+        None, description="Inner CV used for model selection when tuning is enabled."
+    )
 
 
 class FeatureSelectionConfig(BaseModel):
-    """Configuration for Sequential Feature Selection."""
+    """Feature selection settings."""
 
     enabled: bool = False
     method: Literal["k_best", "sfs"] = "sfs"
     n_features: Optional[int] = Field(None, description="Number of features to select.")
     direction: Literal["forward", "backward"] = "forward"
-    cv: Optional[int] = Field(None, description="Inner CV splits. Required for SFS.")
+    cv: Optional[CVConfig] = Field(
+        None, description="Inner CV used by SequentialFeatureSelector."
+    )
     scoring: Optional[str] = None
 
 
@@ -615,6 +661,8 @@ class ExperimentConfig(BaseModel):
     """
     Master configuration for a Decoding Experiment.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     task: Literal["classification", "regression"] = "classification"
     output_dir: Optional[Path] = None

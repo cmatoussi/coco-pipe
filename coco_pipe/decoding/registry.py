@@ -40,7 +40,7 @@ _LAZY_MODULES = {
     "SGDClassifier": "sklearn.linear_model",
     "MLPClassifier": "sklearn.neural_network",
     "GaussianNB": "sklearn.naive_bayes",
-    "LDA": "sklearn.discriminant_analysis",
+    "LinearDiscriminantAnalysis": "sklearn.discriminant_analysis",
     "AdaBoostClassifier": "sklearn.ensemble",
     "DummyClassifier": "sklearn.dummy",
     # Regressors
@@ -50,6 +50,16 @@ _LAZY_MODULES = {
     "ElasticNet": "sklearn.linear_model",
     "RandomForestRegressor": "sklearn.ensemble",
     "SVR": "sklearn.svm",
+    "GradientBoostingRegressor": "sklearn.ensemble",
+    "SGDRegressor": "sklearn.linear_model",
+    "MLPRegressor": "sklearn.neural_network",
+    "DummyRegressor": "sklearn.dummy",
+    "DecisionTreeRegressor": "sklearn.tree",
+    "KNeighborsRegressor": "sklearn.neighbors",
+    "ExtraTreesRegressor": "sklearn.ensemble",
+    "HistGradientBoostingRegressor": "sklearn.ensemble",
+    "AdaBoostRegressor": "sklearn.ensemble",
+    "BayesianRidge": "sklearn.linear_model",
     "ARDRegression": "sklearn.linear_model",
 }
 

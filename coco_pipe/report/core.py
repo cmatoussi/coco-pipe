@@ -1206,6 +1206,62 @@ class Report(ContainerElement):
         self.add_section(sec)
         return self
 
+    def add_decoding_temporal(
+        self,
+        result: Any,
+        metric: Optional[str] = None,
+        model: Optional[str] = None,
+        name: str = "Temporal Decoding",
+    ) -> "Report":
+        """
+        Add a compact temporal decoding section from an ExperimentResult.
+        """
+        from coco_pipe.viz.decoding import (
+            plot_temporal_generalization_matrix,
+            plot_temporal_score_curve,
+        )
+
+        if not hasattr(result, "get_temporal_score_summary"):
+            raise TypeError(
+                "result must provide get_temporal_score_summary() for temporal "
+                "decoding report sections."
+            )
+
+        summary = result.get_temporal_score_summary()
+        if metric is not None:
+            summary = summary[summary["Metric"] == metric]
+        if model is not None:
+            summary = summary[summary["Model"] == model]
+        if summary.empty:
+            raise ValueError("No temporal decoding scores available for report.")
+
+        sec = Section(title=name, icon="📈")
+        sec.add_element(TableElement(summary, title="Temporal Score Summary"))
+
+        if "Time" in summary and summary["Time"].notna().any():
+            fig_curve = plot_temporal_score_curve(
+                summary, metric=metric, model=model, title="Temporal Score Curve"
+            )
+            sec.add_element(ImageElement(fig_curve, caption="Temporal score curve"))
+
+        if (
+            {"TrainTime", "TestTime"}.issubset(summary.columns)
+            and summary["TrainTime"].notna().any()
+            and summary["TestTime"].notna().any()
+        ):
+            fig_matrix = plot_temporal_generalization_matrix(
+                summary,
+                metric=metric,
+                model=model,
+                title="Temporal Generalization Matrix",
+            )
+            sec.add_element(
+                ImageElement(fig_matrix, caption="Temporal generalization matrix")
+            )
+
+        self.add_section(sec)
+        return self
+
     def render(self) -> str:
         """
         Render the full HTML report.
