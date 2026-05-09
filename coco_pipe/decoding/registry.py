@@ -19,60 +19,59 @@ Usage
 import importlib
 import pkgutil
 import warnings
-from importlib.metadata import entry_points
 from typing import Callable, Dict, Type
+
+from .capabilities import (
+    EstimatorCapabilities,
+    EstimatorSpec,
+    get_estimator_capabilities,
+    get_estimator_spec,
+    list_estimator_specs,
+    register_estimator_spec,
+    resolve_estimator_capabilities,
+)
+
+__all__ = [
+    "register_estimator",
+    "register_spec",
+    "get_estimator_cls",
+    "list_estimators",
+    "get_capabilities",
+    "list_capabilities",
+    "get_spec",
+    "list_specs",
+    "get_estimator_spec",
+    "list_estimator_specs",
+    "register_estimator_spec",
+    "get_estimator_capabilities",
+    "resolve_estimator_capabilities",
+]
 
 # Registry Storage
 # Maps string alias -> class object
 _ESTIMATOR_REGISTRY: Dict[str, Type] = {}
-
-
-_LAZY_MODULES = {
-    # MNE
-    "SlidingEstimator": "mne.decoding",
-    "GeneralizingEstimator": "mne.decoding",
-    # Classifiers
-    "LogisticRegression": "sklearn.linear_model",
-    "RandomForestClassifier": "sklearn.ensemble",
-    "SVC": "sklearn.svm",
-    "KNeighborsClassifier": "sklearn.neighbors",
-    "GradientBoostingClassifier": "sklearn.ensemble",
-    "SGDClassifier": "sklearn.linear_model",
-    "MLPClassifier": "sklearn.neural_network",
-    "GaussianNB": "sklearn.naive_bayes",
-    "LinearDiscriminantAnalysis": "sklearn.discriminant_analysis",
-    "AdaBoostClassifier": "sklearn.ensemble",
-    "DummyClassifier": "sklearn.dummy",
-    # Regressors
-    "LinearRegression": "sklearn.linear_model",
-    "Ridge": "sklearn.linear_model",
-    "Lasso": "sklearn.linear_model",
-    "ElasticNet": "sklearn.linear_model",
-    "RandomForestRegressor": "sklearn.ensemble",
-    "SVR": "sklearn.svm",
-    "GradientBoostingRegressor": "sklearn.ensemble",
-    "SGDRegressor": "sklearn.linear_model",
-    "MLPRegressor": "sklearn.neural_network",
-    "DummyRegressor": "sklearn.dummy",
-    "DecisionTreeRegressor": "sklearn.tree",
-    "KNeighborsRegressor": "sklearn.neighbors",
-    "ExtraTreesRegressor": "sklearn.ensemble",
-    "HistGradientBoostingRegressor": "sklearn.ensemble",
-    "AdaBoostRegressor": "sklearn.ensemble",
-    "BayesianRidge": "sklearn.linear_model",
-    "ARDRegression": "sklearn.linear_model",
-}
+_INTERNAL_SCANNED = False
 
 
 def _discover_entry_points():
     """
-    Populate _LAZY_MODULES from 'coco_pipe.estimators' entry points.
-    This allows plugins to register estimators without modifying code.
+    Import 'coco_pipe.estimators' entry points.
+
+    Plugins should call ``register_estimator_spec`` or ``register_estimator``
+    when imported. We avoid inventing incomplete specs from string entry points.
     """
-    eps = entry_points(group="coco_pipe.estimators")
+    try:
+        from importlib.metadata import entry_points
+
+        eps = entry_points(group="coco_pipe.estimators")
+    except Exception:
+        return
+
     for ep in eps:
-        if ep.name not in _LAZY_MODULES:
-            _LAZY_MODULES[ep.name] = ep.value
+        try:
+            ep.load()
+        except Exception:
+            warnings.warn(f"Could not load estimator entry point '{ep.name}'")
 
 
 def _discover_internal_modules():
@@ -118,6 +117,11 @@ def register_estimator(name: str) -> Callable[[Type], Type]:
     return decorator
 
 
+def register_spec(spec: EstimatorSpec) -> EstimatorSpec:
+    """Register a typed estimator spec."""
+    return register_estimator_spec(spec)
+
+
 def get_estimator_cls(name: str) -> Type:
     """
     Retrieve an estimator class by name.
@@ -141,22 +145,23 @@ def get_estimator_cls(name: str) -> Type:
     if name in _ESTIMATOR_REGISTRY:
         return _ESTIMATOR_REGISTRY[name]
 
-    # 2. Try Lazy Loading Map
-    if name in _LAZY_MODULES:
-        try:
-            mod_path = _LAZY_MODULES[name]
-            if ":" in mod_path:
-                mod_path = mod_path.split(":")[0]
+    # 2. Try typed spec lazy import target.
+    try:
+        spec = get_estimator_spec(name)
+    except ValueError:
+        spec = None
 
-            module = importlib.import_module(mod_path)
+    if spec is not None:
+        try:
+            module = importlib.import_module(spec.module_path)
         except ImportError as e:
             raise ImportError(
-                f"Could not load estimator '{name}' from '{_LAZY_MODULES[name]}'. "
+                f"Could not load estimator '{name}' from '{spec.import_path}'. "
                 f"Ensure optional dependencies are installed."
             ) from e
 
-        if hasattr(module, name):
-            cls = getattr(module, name)
+        if hasattr(module, spec.class_name):
+            cls = getattr(module, spec.class_name)
             _ESTIMATOR_REGISTRY[name] = cls
             return cls
 
@@ -165,15 +170,16 @@ def get_estimator_cls(name: str) -> Type:
             return _ESTIMATOR_REGISTRY[name]
 
     # 3. Last Ditch: Internal Discovery
-    if not getattr(get_estimator_cls, "_internal_scanned", False):
+    global _INTERNAL_SCANNED
+    if not _INTERNAL_SCANNED:
         _discover_internal_modules()
-        setattr(get_estimator_cls, "_internal_scanned", True)
+        _INTERNAL_SCANNED = True
         if name in _ESTIMATOR_REGISTRY:
             return _ESTIMATOR_REGISTRY[name]
 
     if name not in _ESTIMATOR_REGISTRY:
         # Generate helpful error
-        available = sorted(list(_ESTIMATOR_REGISTRY.keys()))
+        available = sorted(set(_ESTIMATOR_REGISTRY) | set(list_estimator_specs()))
         raise ValueError(
             f"Estimator '{name}' not found in registry.\n"
             f"Available estimators: {available}\n"
@@ -187,7 +193,31 @@ def get_estimator_cls(name: str) -> Type:
 def list_estimators() -> Dict[str, Type]:
     """Return a copy of the current registry."""
     # Ensure everything is discovered before listing
-    if not getattr(get_estimator_cls, "_internal_scanned", False):
+    global _INTERNAL_SCANNED
+    if not _INTERNAL_SCANNED:
         _discover_internal_modules()
-        setattr(get_estimator_cls, "_internal_scanned", True)
+        _INTERNAL_SCANNED = True
     return dict(_ESTIMATOR_REGISTRY)
+
+
+def get_capabilities(name: str) -> EstimatorCapabilities:
+    """Return registered decoding capabilities for an estimator name."""
+    return get_estimator_capabilities(name)
+
+
+def list_capabilities() -> Dict[str, EstimatorCapabilities]:
+    """Return capability metadata for known decoding estimators."""
+    return {
+        name: get_estimator_capabilities(name)
+        for name in sorted(list_estimator_specs())
+    }
+
+
+def get_spec(name: str) -> EstimatorSpec:
+    """Return the typed estimator spec for an estimator name."""
+    return get_estimator_spec(name)
+
+
+def list_specs() -> Dict[str, EstimatorSpec]:
+    """Return typed estimator specs."""
+    return list_estimator_specs()

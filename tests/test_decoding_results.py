@@ -1,5 +1,6 @@
 import numpy as np
 
+from coco_pipe.decoding.cache import make_feature_cache_key
 from coco_pipe.decoding.configs import (
     CVConfig,
     ExperimentConfig,
@@ -42,12 +43,18 @@ def test_run_result_payload_stores_config_provenance_sample_ids_and_groups():
     X, y = _classification_data()
     sample_ids = np.array([f"sample_{idx}" for idx in range(len(y))])
     groups = np.array(["g0", "g0", "g1", "g1", "g2", "g2", "g3", "g3"])
+    sample_metadata = {
+        "subject": ["s0", "s0", "s1", "s1", "s2", "s2", "s3", "s3"],
+        "session": ["visit1"] * len(y),
+    }
 
     result = Experiment(_config()).run(
         X,
         y,
         groups=groups,
         sample_ids=sample_ids,
+        sample_metadata=sample_metadata,
+        observation_level="epoch",
         feature_names=["left", "right"],
     )
 
@@ -57,17 +64,100 @@ def test_run_result_payload_stores_config_provenance_sample_ids_and_groups():
     assert payload["meta"]["task"] == "classification"
     assert payload["meta"]["n_samples"] == len(y)
     assert payload["meta"]["n_features"] == X.shape[1]
+    assert payload["meta"]["observation_level"] == "epoch"
+    assert payload["meta"]["inferential_unit"] == "subject"
+    assert payload["meta"]["sample_metadata_columns"] == [
+        "subject",
+        "session",
+        "site",
+    ]
     assert "versions" in payload["meta"]
 
     predictions = result.get_predictions()
-    assert {"SampleIndex", "SampleID", "Group"}.issubset(predictions.columns)
+    assert {
+        "SampleIndex",
+        "SampleID",
+        "Group",
+        "Subject",
+        "Session",
+        "Site",
+    }.issubset(predictions.columns)
     assert set(predictions["SampleID"]) == set(sample_ids)
     assert set(predictions["Group"]) == set(groups)
+    assert set(predictions["Subject"]) == {"s0", "s1", "s2", "s3"}
+    assert set(predictions["Session"]) == {"visit1"}
 
     splits = result.get_splits()
     assert set(splits["Set"]) == {"train", "test"}
     assert set(splits["SampleID"]) == set(sample_ids)
     assert set(splits["Group"]) == set(groups)
+    assert {"Subject", "Session", "Site"}.issubset(splits.columns)
+
+    ci = result.get_bootstrap_confidence_intervals(
+        n_bootstraps=10,
+        random_state=0,
+    )
+    assert set(ci["Unit"]) == {"subject"}
+
+
+def test_duplicate_sample_ids_are_rejected():
+    X, y = _classification_data()
+
+    try:
+        Experiment(_config()).run(X, y, sample_ids=["s0"] * len(y))
+    except ValueError as exc:
+        assert "sample_ids must be unique" in str(exc)
+    else:
+        raise AssertionError("Expected duplicate sample_ids to fail.")
+
+
+def test_observation_level_is_explicitly_limited():
+    X, y = _classification_data()
+
+    try:
+        Experiment(_config()).run(X, y, observation_level="trial")
+    except ValueError as exc:
+        assert "observation_level must be 'sample' or 'epoch'" in str(exc)
+    else:
+        raise AssertionError("Expected invalid observation_level to fail.")
+
+
+def test_sample_metadata_requires_subject_and_session():
+    X, y = _classification_data()
+
+    try:
+        Experiment(_config()).run(
+            X,
+            y,
+            sample_metadata={"subject": [f"s{idx}" for idx in range(len(y))]},
+        )
+    except ValueError as exc:
+        assert "sample_metadata must include subject and session" in str(exc)
+    else:
+        raise AssertionError("Expected incomplete sample_metadata to fail.")
+
+
+def test_explicit_inferential_unit_overrides_epoch_default():
+    X, y = _classification_data()
+    metadata = {
+        "subject": [f"s{idx // 2}" for idx in range(len(y))],
+        "session": ["visit1"] * len(y),
+    }
+
+    result = Experiment(_config()).run(
+        X,
+        y,
+        sample_metadata=metadata,
+        observation_level="epoch",
+        inferential_unit="epoch",
+    )
+
+    assert result.meta["inferential_unit"] == "epoch"
+    ci = result.get_bootstrap_confidence_intervals(
+        n_bootstraps=10,
+        random_state=0,
+    )
+    assert set(ci["Unit"]) == {"epoch"}
 
 
 def test_save_load_roundtrip_preserves_decoding_payload(tmp_path):
@@ -204,3 +294,37 @@ def test_get_feature_importances_returns_named_aggregate_and_fold_tables():
     ]
     assert len(fold_level) == 4
     assert set(fold_level["Fold"]) == {0, 1}
+
+
+def test_feature_cache_key_tracks_split_preprocessing_and_backbone_identity():
+    base = make_feature_cache_key(
+        train_sample_ids=["s0", "s1"],
+        test_sample_ids=["s2"],
+        preprocessing_fingerprint="prep-a",
+        backbone_fingerprint="backbone-a",
+    )
+
+    assert base == make_feature_cache_key(
+        train_sample_ids=["s0", "s1"],
+        test_sample_ids=["s2"],
+        preprocessing_fingerprint="prep-a",
+        backbone_fingerprint="backbone-a",
+    )
+    assert base != make_feature_cache_key(
+        train_sample_ids=["s0"],
+        test_sample_ids=["s1", "s2"],
+        preprocessing_fingerprint="prep-a",
+        backbone_fingerprint="backbone-a",
+    )
+    assert base != make_feature_cache_key(
+        train_sample_ids=["s0", "s1"],
+        test_sample_ids=["s2"],
+        preprocessing_fingerprint="prep-b",
+        backbone_fingerprint="backbone-a",
+    )
+    assert base != make_feature_cache_key(
+        train_sample_ids=["s0", "s1"],
+        test_sample_ids=["s2"],
+        preprocessing_fingerprint="prep-a",
+        backbone_fingerprint="backbone-b",
+    )

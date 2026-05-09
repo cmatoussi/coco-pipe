@@ -88,6 +88,35 @@ topology = [
     "skorch",
     "gudhi",
 ]
+torch = [
+    "torch",
+]
+braindecode = [
+    "braindecode",
+]
+hf = [
+    "transformers",
+    "huggingface-hub",
+]
+peft = [
+    "peft",
+    "accelerate",
+]
+quant = [
+    "bitsandbytes",
+]
+moabb = [
+    "moabb",
+    "mne",
+]
+torcheeg = [
+    "torcheeg",
+]
+dev-gpu = [
+    "pytest>=7.0",
+    "torch",
+    "accelerate",
+]
 spatiotemporal = [
     "pydmd",
     "meegkit",

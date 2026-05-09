@@ -130,6 +130,9 @@ def test_multiple_models_and_failed_model_are_reported_independently():
 
     assert set(result.raw) == {"dummy", "bad"}
     assert "error" not in result.raw["dummy"]
+    assert "predictions" in result.raw["dummy"]
+    assert "splits" in result.raw["dummy"]
+    assert len(result.get_predictions().query("Model == 'dummy'")) == len(y)
     assert result.raw["bad"]["status"] == "failed"
     assert "lbfgs" in result.raw["bad"]["error"]
     assert "dummy" in result.summary().index

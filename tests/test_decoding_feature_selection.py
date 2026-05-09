@@ -132,23 +132,25 @@ def test_feature_names_must_align_with_array_feature_dimension():
         Experiment(config).run(X, y, feature_names=["alpha", "beta"])
 
 
-def test_sfs_requires_explicit_feature_selection_cv():
-    with pytest.raises(ValueError, match="feature_selection.cv"):
-        Experiment(
-            ExperimentConfig(
-                task="classification",
-                models={"lr": _lr_model()},
-                metrics=["accuracy"],
-                cv=CVConfig(strategy="stratified", n_splits=3),
-                feature_selection=FeatureSelectionConfig(
-                    enabled=True,
-                    method="sfs",
-                    n_features=2,
-                ),
-                n_jobs=1,
-                verbose=False,
-            )
-        )
+def test_sfs_defaults_to_outer_cv_when_tuning_is_disabled():
+    config = ExperimentConfig(
+        task="classification",
+        models={"lr": _lr_model()},
+        metrics=["accuracy"],
+        cv=CVConfig(strategy="stratified", n_splits=3),
+        feature_selection=FeatureSelectionConfig(
+            enabled=True,
+            method="sfs",
+            n_features=2,
+        ),
+        n_jobs=1,
+        verbose=False,
+    )
+
+    estimator = Experiment(config)._prepare_estimator("lr", config.models["lr"])
+
+    assert estimator.named_steps["fs"].cv.__class__.__name__ == "StratifiedKFold"
+    assert estimator.named_steps["fs"].cv.n_splits == 3
 
 
 def test_group_based_sfs_cv_uses_group_splitter():
@@ -366,6 +368,54 @@ def test_sfs_scoring_falls_back_to_tuning_then_first_metric():
     )
 
     assert metric_estimator.named_steps["fs"].scoring == "f1_macro"
+
+
+def test_sfs_cv_defaults_to_tuning_cv_when_tuning_is_enabled():
+    config = ExperimentConfig(
+        task="classification",
+        models={"lr": _lr_model()},
+        grids={"lr": {"C": [0.1, 1.0]}},
+        metrics=["accuracy"],
+        cv=CVConfig(strategy="stratified", n_splits=4),
+        tuning=TuningConfig(
+            enabled=True,
+            scoring="accuracy",
+            n_jobs=1,
+            cv=CVConfig(strategy="kfold", n_splits=2, shuffle=False),
+        ),
+        feature_selection=FeatureSelectionConfig(
+            enabled=True,
+            method="sfs",
+            n_features=2,
+        ),
+        n_jobs=1,
+        verbose=False,
+    )
+
+    estimator = Experiment(config)._prepare_estimator("lr", config.models["lr"])
+
+    assert estimator.estimator.named_steps["fs"].cv.__class__.__name__ == "KFold"
+    assert estimator.estimator.named_steps["fs"].cv.n_splits == 2
+
+
+def test_nongroup_sfs_cv_under_grouped_outer_requires_override():
+    with pytest.raises(ValueError, match="allow_nongroup_inner_cv"):
+        Experiment(
+            ExperimentConfig(
+                task="classification",
+                models={"lr": _lr_model()},
+                metrics=["accuracy"],
+                cv=CVConfig(strategy="group_kfold", n_splits=3),
+                feature_selection=FeatureSelectionConfig(
+                    enabled=True,
+                    method="sfs",
+                    n_features=2,
+                    cv=CVConfig(strategy="stratified", n_splits=2),
+                ),
+                n_jobs=1,
+                verbose=False,
+            )
+        )
 
 
 def test_sfs_with_tuning_records_selected_feature_names_from_best_estimator():

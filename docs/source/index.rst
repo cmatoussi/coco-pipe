@@ -6,9 +6,9 @@ Welcome to coco-pipe's documentation!
    :caption: Contents:
 
    README.md
+   api_reference.md
    vision.md
    dim_reduction.md
    decoding.md
    auto_examples/index.rst
-   autoapi/index.rst
    GitHub Repository <https://github.com/BabaSanfour/coco-pipe>

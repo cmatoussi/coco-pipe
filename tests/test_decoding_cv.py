@@ -167,8 +167,31 @@ def test_grouped_outer_cv_experiment_respects_group_boundaries():
             assert set(np.flatnonzero(groups == group)).issubset(set(test_idx))
 
 
-def test_tuning_requires_explicit_inner_cv():
-    with pytest.raises(ValueError, match="requires an explicit inner CV"):
+def test_tuning_defaults_to_outer_group_cv_family():
+    config = ExperimentConfig(
+        task="classification",
+        models={
+            "lr": {
+                "method": "LogisticRegression",
+                "solver": "liblinear",
+                "max_iter": 200,
+            }
+        },
+        grids={"lr": {"C": [0.1, 1.0]}},
+        tuning=TuningConfig(enabled=True, scoring="accuracy", n_jobs=1),
+        metrics=["accuracy"],
+        cv=CVConfig(strategy="group_kfold", n_splits=3),
+        n_jobs=1,
+        verbose=False,
+    )
+
+    estimator = Experiment(config)._prepare_estimator("lr", config.models["lr"])
+
+    assert isinstance(estimator.cv, GroupKFold)
+
+
+def test_nongroup_tuning_cv_under_grouped_outer_requires_override():
+    with pytest.raises(ValueError, match="allow_nongroup_inner_cv"):
         Experiment(
             ExperimentConfig(
                 task="classification",
@@ -180,13 +203,47 @@ def test_tuning_requires_explicit_inner_cv():
                     }
                 },
                 grids={"lr": {"C": [0.1, 1.0]}},
-                tuning=TuningConfig(enabled=True, scoring="accuracy", n_jobs=1),
+                tuning=TuningConfig(
+                    enabled=True,
+                    scoring="accuracy",
+                    n_jobs=1,
+                    cv=CVConfig(strategy="stratified", n_splits=2),
+                ),
                 metrics=["accuracy"],
                 cv=CVConfig(strategy="group_kfold", n_splits=3),
                 n_jobs=1,
                 verbose=False,
             )
         )
+
+
+def test_nongroup_tuning_cv_under_grouped_outer_allows_explicit_override():
+    config = ExperimentConfig(
+        task="classification",
+        models={
+            "lr": {
+                "method": "LogisticRegression",
+                "solver": "liblinear",
+                "max_iter": 200,
+            }
+        },
+        grids={"lr": {"C": [0.1, 1.0]}},
+        tuning=TuningConfig(
+            enabled=True,
+            scoring="accuracy",
+            n_jobs=1,
+            cv=CVConfig(strategy="stratified", n_splits=2),
+            allow_nongroup_inner_cv=True,
+        ),
+        metrics=["accuracy"],
+        cv=CVConfig(strategy="group_kfold", n_splits=3),
+        n_jobs=1,
+        verbose=False,
+    )
+
+    estimator = Experiment(config)._prepare_estimator("lr", config.models["lr"])
+
+    assert isinstance(estimator.cv, StratifiedKFold)
 
 
 def test_grouped_tuning_receives_training_fold_groups():

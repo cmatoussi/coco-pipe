@@ -3,7 +3,12 @@ import pytest
 
 from coco_pipe.decoding import Experiment, ExperimentConfig
 from coco_pipe.decoding.configs import CVConfig
-from coco_pipe.decoding.metrics import get_metric_names, get_metric_spec, get_scorer
+from coco_pipe.decoding.metrics import (
+    get_metric_families,
+    get_metric_names,
+    get_metric_spec,
+    get_scorer,
+)
 
 
 def test_classification_scorers():
@@ -64,9 +69,23 @@ def test_regression_scorers():
 def test_metric_registry_exposes_task_metadata():
     assert get_metric_spec("roc_auc").task == "classification"
     assert get_metric_spec("roc_auc").response_method == "proba_or_score"
+    assert get_metric_spec("roc_auc").family == "threshold_sweep"
     assert get_metric_spec("log_loss").response_method == "proba"
+    assert get_metric_spec("log_loss").family == "score_probability"
+    assert get_metric_spec("brier_score").family == "calibration"
     assert "accuracy" in get_metric_names("classification")
     assert "r2" in get_metric_names("regression")
+
+
+def test_metric_registry_exposes_family_metadata_and_filters():
+    assert "roc_auc" in get_metric_names(family="threshold_sweep")
+    assert "average_precision" in get_metric_names(
+        task="classification",
+        family="threshold_sweep",
+    )
+    assert get_metric_names(task="regression", family="threshold_sweep") == []
+    assert "confusion" in get_metric_families("classification")
+    assert get_metric_families("regression") == ["regression"]
 
 
 def test_metric_task_validation_uses_registry():

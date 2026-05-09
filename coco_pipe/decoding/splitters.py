@@ -44,6 +44,16 @@ class _CVWithGroups(BaseCrossValidator):
     def get_n_splits(self, X=None, y=None, groups=None):
         return self.cv.get_n_splits(X, y, self.groups)
 
+    def _get_tags(self):
+        tags = getattr(self.cv, "_get_tags", lambda: {})()
+        return {**tags, "non_deterministic": tags.get("non_deterministic", False)}
+
+    def get_params(self, deep=True):
+        return {"cv": self.cv, "groups": self.groups}
+
+    def __repr__(self):
+        return f"_CVWithGroups(cv={self.cv!r})"
+
 
 class SimpleSplit(BaseCrossValidator):
     """One train/test split using ``train_test_split``."""
@@ -92,6 +102,9 @@ class SimpleSplit(BaseCrossValidator):
         groups: Any = None,
     ) -> int:
         return 1
+
+    def _get_tags(self):
+        return {"non_deterministic": self.shuffle}
 
 
 def get_cv_splitter(
