@@ -1352,7 +1352,7 @@ class Report(ContainerElement):
             timing_cols = ["Model", "Fold", "FitTime", "PredictTime", "TotalTime"]
             timing_cols = [c for c in timing_cols if c in diagnostics.columns]
             timings = diagnostics[timing_cols].drop_duplicates()
-            sec.add_element(TableElement(timings, title="Fold Execution Timings"))
+            sec.add_element(TableElement(timings, title="Fit Diagnostics"))
 
             # 2. Warnings Table (only if they exist)
             warns = diagnostics[diagnostics["WarningMessage"].notna()]

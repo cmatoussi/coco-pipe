@@ -8,8 +8,6 @@ import atexit
 import logging
 import time
 from collections import defaultdict
-from datetime import datetime
-from pathlib import Path
 from shutil import rmtree
 from tempfile import mkdtemp
 from typing import Any, Dict, Optional, Sequence, Union
@@ -20,7 +18,6 @@ import pandas as pd
 from sklearn.base import BaseEstimator, clone
 from sklearn.feature_selection import (
     SelectKBest,
-    SequentialFeatureSelector,
     f_classif,
     f_regression,
 )
@@ -29,19 +26,18 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils.multiclass import type_of_target
 
 from ..report.provenance import get_environment_info
-from .capabilities import (
-    canonical_estimator_name,
+from ._constants import CLASSICAL_FAMILIES, GROUP_CV_STRATEGIES, RESULT_SCHEMA_VERSION
+from ._engine import GroupedSequentialFeatureSelector, fit_and_score_fold
+from ._metrics import get_metric_spec
+from ._splitters import get_cv_splitter
+from .configs import ExperimentConfig
+from .registry import (
+    _get_val,
+    get_estimator_cls,
     get_selector_capabilities,
-    resolve_estimator_capabilities,
     resolve_estimator_spec,
 )
-from .configs import ExperimentConfig
-from .constants import GROUP_CV_STRATEGIES, RESULT_SCHEMA_VERSION
-from .engine import fit_and_score_fold
-from .metrics import get_metric_names, get_metric_spec
-from .registry import get_estimator_cls
 from .result import ExperimentResult
-from .splitters import get_cv_splitter
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +50,19 @@ class Experiment:
     ----------
     config : ExperimentConfig
         The complete configuration for the experiment.
+
+    Examples
+    --------
+    >>> from coco_pipe.decoding import Experiment, ExperimentConfig
+    >>> config = ExperimentConfig(
+    ...     task="classification", models={"lr": {"kind": "classical"}}
+    ... )
+    >>> exp = Experiment(config)
+
+    See Also
+    --------
+    ExperimentResult : Container for experiment outputs.
+    get_cv_splitter : Factory for cross-validation splitters.
     """
 
     def __init__(self, config: ExperimentConfig):
@@ -73,31 +82,54 @@ class Experiment:
                 "Hyperparameter tuning is enabled but no 'grids' are defined "
                 "in the config."
             )
+
         if self.config.calibration.enabled and task != "classification":
-            raise ValueError(
-                "Probability calibration is only available for classification."
-            )
-
-        self._validate_inner_cv_overrides()
-
-        for metric in self.config.metrics:
-            if get_metric_spec(metric).task != task:
-                raise ValueError(
-                    f"Metric '{metric}' is incompatible with task '{task}'. "
-                    f"Available {task} metrics: {get_metric_names(task)}."
-                )
-
-        for metric in self._evaluation_metrics():
-            if get_metric_spec(metric).task != task:
-                raise ValueError(
-                    f"Statistical assessment metric '{metric}' is incompatible "
-                    f"with task '{task}'."
-                )
+            raise ValueError("calibration is only available for classification.")
 
         if task == "regression" and "stratified" in self.config.cv.strategy:
             raise ValueError(
                 f"CV strategy '{self.config.cv.strategy}' is invalid "
                 "for regression tasks."
+            )
+
+        # 1. Inner CV Grouping Validation (Leakage Guard)
+        if self.config.cv.strategy in GROUP_CV_STRATEGIES:
+            targets = []
+            if self.config.tuning.enabled:
+                targets.append(
+                    (
+                        "tuning.cv",
+                        self.config.tuning.cv,
+                        self.config.tuning.allow_nongroup_inner_cv,
+                    )
+                )
+            fs = self.config.feature_selection
+            if fs.enabled and fs.method == "sfs":
+                targets.append(
+                    ("feature_selection.cv", fs.cv, fs.allow_nongroup_inner_cv)
+                )
+            cal = self.config.calibration
+            if cal.enabled:
+                targets.append(("calibration.cv", cal.cv, cal.allow_nongroup_inner_cv))
+
+            for name, cv_cfg, allowed in targets:
+                if (
+                    cv_cfg
+                    and cv_cfg.strategy not in GROUP_CV_STRATEGIES
+                    and not allowed
+                ):
+                    raise ValueError(
+                        f"Outer CV strategy is group-based, but {name} strategy "
+                        f"'{cv_cfg.strategy}' is not. This leads to data leakage. "
+                        "Set allow_nongroup_inner_cv=True if this is intentional."
+                    )
+
+        # Validate FS scoring if explicitly set
+        fs_scoring = self.config.feature_selection.scoring
+        if fs_scoring and get_metric_spec(fs_scoring).task != task:
+            raise ValueError(
+                f"Feature selection scoring '{fs_scoring}' is incompatible with "
+                f"task '{task}'."
             )
 
         for name, model_cfg in self.config.models.items():
@@ -108,12 +140,43 @@ class Experiment:
             if not caps.supports_task(task):
                 raise ValueError(f"Model '{name}' does not support task '{task}'.")
 
+            # 2. Metric Compatibility Check
+            has_proba = (
+                caps.has_response("predict_proba") or self.config.calibration.enabled
+            )
+            has_score = caps.has_response("decision_function")
+            for metric in self.config.get_all_evaluation_metrics():
+                m_spec = get_metric_spec(metric)
+                if m_spec.task != task:
+                    raise ValueError(
+                        f"Metric '{metric}' is for {m_spec.task} but experiment task "
+                        f"is {task}."
+                    )
+                if m_spec.response_method == "proba" and not has_proba:
+                    raise ValueError(
+                        f"Metric '{metric}' requires probabilities, but model "
+                        f"'{name}' doesn't provide them (and calibration is disabled)."
+                    )
+                if m_spec.response_method == "proba_or_score" and not (
+                    has_proba or has_score
+                ):
+                    raise ValueError(
+                        f"Metric '{metric}' requires probabilities or decision scores, "
+                        f"but model '{name}' provides neither."
+                    )
+
     def _prepare_estimator(self, model_name: str, model_config: Any) -> BaseEstimator:
         """Orchestrate the creation of the full Estimator Pipeline."""
-        self._validate_metric_capabilities(model_name, model_config)
+
         full_est = self._instantiate_model(model_name, model_config)
+        spec = self._model_specs.get(model_name) or resolve_estimator_spec(model_config)
         steps = []
-        allow_prep = self._allows_pipeline_preprocessing(model_config)
+
+        # Classical models on tabular/embedding data support standard preprocessing
+        allow_prep = spec.family in CLASSICAL_FAMILIES and any(
+            k in {"tabular_2d", "embedding_2d", "tabular", "embeddings"}
+            for k in spec.input_kinds
+        )
 
         if self.config.use_scaler and allow_prep:
             steps.append(("scaler", StandardScaler()))
@@ -124,8 +187,8 @@ class Experiment:
                 steps.append(fs_step)
         elif self.config.feature_selection.enabled and not allow_prep:
             raise ValueError(
-                "Feature selection is only valid for classical 2D tabular "
-                "or embedding inputs."
+                f"Feature selection is only valid for classical 2D tabular "
+                f"inputs. Model '{model_name}' uses {spec.input_kinds} data."
             )
 
         steps.append(("clf", full_est))
@@ -146,217 +209,129 @@ class Experiment:
             and self.config.grids
             and model_name in self.config.grids
         ):
-            est = self._wrap_with_tuning(est, model_name)
+            est = self._wrap_with_tuning(model_name, est)
 
         if self.config.calibration.enabled:
-            est = self._wrap_with_calibration(est)
+            from sklearn.calibration import CalibratedClassifierCV
+
+            cal_cv = get_cv_splitter(self.config.calibration.cv, require_groups=False)
+            est = CalibratedClassifierCV(
+                estimator=est,
+                method=self.config.calibration.method,
+                cv=cal_cv,
+                n_jobs=self.config.calibration.n_jobs or self.config.n_jobs,
+            )
         return est
 
-    def _resolved_tuning_cv(self):
-        return self.config.tuning.cv or self._outer_cv_copy()
-
-    def _resolved_feature_selection_cv(self):
-        fs_conf = self.config.feature_selection
-        if fs_conf.cv is not None:
-            return fs_conf.cv
-        if self.config.tuning.enabled:
-            return self._resolved_tuning_cv()
-        return self._outer_cv_copy()
-
-    def _resolved_calibration_cv(self):
-        return self.config.calibration.cv or self._outer_cv_copy()
-
-    def _outer_cv_copy(self):
-        return self.config.cv.model_copy(deep=True)
-
-    @staticmethod
-    def _allows_pipeline_preprocessing(model_config: Any) -> bool:
-        if getattr(model_config, "kind", None) != "classical":
-            return False
-        return getattr(model_config, "input_kind", "tabular") in {
-            "tabular",
-            "embeddings",
-        }
-
     def _propagate_random_state(self):
-        """Propagate the global random_state to all components if set."""
-        global_seed = self.config.random_state
-        if global_seed is None:
+        """Ensure the global random state is distributed to all config sub-objects."""
+        seed = self.config.random_state
+        if seed is None:
             return
 
+        self._inject_seed(self.config.cv, seed)
+        self._inject_seed(self.config.feature_selection, seed + 1)
+        self._inject_seed(self.config.tuning, seed + 2)
+        self._inject_seed(self.config.calibration, seed + 3)
+
+        # 2. Model seeds
+        model_names = sorted(self.config.models.keys())
         from numpy.random import SeedSequence
 
-        ss = SeedSequence(global_seed)
+        ss = SeedSequence(seed + 4)
+        model_seeds = ss.spawn(len(model_names))
+        for name, m_ss in zip(model_names, model_seeds):
+            self._inject_seed(self.config.models[name], int(m_ss.generate_state(1)[0]))
 
-        # Derive seeds for main blocks (stable order)
-        # 0: cv, 1: tuning, 2: feature_selection, 3: evaluation, 4: models
-        child_seeds = ss.spawn(5)
+    def _inject_seed(self, cfg: Any, seed: int):
+        """Safely inject a random seed into a config object if it supports it."""
+        if hasattr(cfg, "random_state"):
+            cfg.random_state = seed
+        if hasattr(cfg, "cv") and cfg.cv and hasattr(cfg.cv, "random_state"):
+            cfg.cv.random_state = seed
 
-        self.config.cv.random_state = int(child_seeds[0].generate_state(1)[0])
-        self.config.tuning.random_state = int(child_seeds[1].generate_state(1)[0])
-        self.config.feature_selection.random_state = int(
-            child_seeds[2].generate_state(1)[0]
-        )
-        self.config.evaluation.random_state = int(child_seeds[3].generate_state(1)[0])
+        # Classical parameters dictionary
+        if getattr(cfg, "kind", None) == "classical" and hasattr(cfg, "params"):
+            if resolve_estimator_spec(cfg).supports_random_state:
+                cfg.params["random_state"] = seed
 
-        # Models
-        model_names = sorted(self.config.models.keys())
-        model_seeds = child_seeds[4].spawn(len(model_names))
-        for name, seed in zip(model_names, model_seeds):
-            cfg = self.config.models[name]
-            derived_seed = int(seed.generate_state(1)[0])
+        # Recursion into sub-components (backbone, head, base)
+        for attr in ("backbone", "head", "base"):
+            if hasattr(cfg, attr):
+                self._inject_seed(getattr(cfg, attr), seed)
 
-            # Handle standard models with explicit fields
-            if hasattr(cfg, "random_state"):
-                cfg.random_state = derived_seed
+    def _instantiate_model(self, model_name: str, config: Any) -> BaseEstimator:
+        """Create a concrete scikit-learn estimator instance from a model config."""
+        # 1. Use the pre-resolved spec for explicit dispatch
+        spec = self._model_specs.get(model_name) or resolve_estimator_spec(config)
 
-            # Handle ClassicalModelConfig by injecting into params if supported
-            if getattr(cfg, "kind", None) == "classical" and hasattr(cfg, "params"):
-                spec = resolve_estimator_spec(cfg)
-                if spec.supports_random_state:
-                    cfg.params["random_state"] = derived_seed
-
-            # Handle temporal wrappers
-            if hasattr(cfg, "base") and hasattr(cfg.base, "random_state"):
-                cfg.base.random_state = derived_seed
-            if (
-                hasattr(cfg, "base")
-                and getattr(cfg.base, "kind", None) == "classical"
-                and hasattr(cfg.base, "params")
-            ):
-                spec = resolve_estimator_spec(cfg.base)
-                if spec.supports_random_state:
-                    cfg.base.params["random_state"] = derived_seed
-
-            # Handle neural wrappers
-            if hasattr(cfg, "head") and hasattr(cfg.head, "random_state"):
-                cfg.head.random_state = derived_seed
-            if (
-                hasattr(cfg, "head")
-                and getattr(cfg.head, "kind", None) == "classical"
-                and hasattr(cfg.head, "params")
-            ):
-                spec = resolve_estimator_spec(cfg.head)
-                if spec.supports_random_state:
-                    cfg.head.params["random_state"] = derived_seed
-
-    def _validate_inner_cv_overrides(self) -> None:
-        if self.config.cv.strategy not in GROUP_CV_STRATEGIES:
-            return
-        checks = []
-        if self.config.tuning.enabled:
-            checks.append(
-                (
-                    "tuning.cv",
-                    self._resolved_tuning_cv(),
-                    self.config.tuning.cv is not None,
-                    self.config.tuning.allow_nongroup_inner_cv,
-                )
-            )
-        fs_conf = self.config.feature_selection
-        if fs_conf.enabled and fs_conf.method == "sfs":
-            inherited = (
-                fs_conf.cv is None
-                and self.config.tuning.enabled
-                and self.config.tuning.cv is not None
-            )
-            allowed = fs_conf.allow_nongroup_inner_cv or (
-                inherited and self.config.tuning.allow_nongroup_inner_cv
-            )
-            checks.append(
-                (
-                    "feature_selection.cv",
-                    self._resolved_feature_selection_cv(),
-                    fs_conf.cv is not None or inherited,
-                    allowed,
-                )
-            )
-        if self.config.calibration.enabled:
-            checks.append(
-                (
-                    "calibration.cv",
-                    self._resolved_calibration_cv(),
-                    self.config.calibration.cv is not None,
-                    self.config.calibration.allow_nongroup_inner_cv,
-                )
-            )
-
-        for name, cv_cfg, explicit, allowed in checks:
-            if cv_cfg.strategy in GROUP_CV_STRATEGIES:
-                continue
-            if explicit and allowed:
-                continue
-            raise ValueError(
-                f"Outer CV strategy is group-based, but {name} strategy "
-                f"'{cv_cfg.strategy}' is not. Set "
-                "allow_nongroup_inner_cv=True to acknowledge leakage."
-            )
-
-    def _wrap_with_calibration(self, estimator: BaseEstimator) -> BaseEstimator:
-        from sklearn.calibration import CalibratedClassifierCV
-
-        cv = get_cv_splitter(self._resolved_calibration_cv(), require_groups=False)
-        return CalibratedClassifierCV(
-            estimator=estimator,
-            method=self.config.calibration.method,
-            cv=cv,
-            n_jobs=self.config.calibration.n_jobs,
-        )
-
-    def _validate_metric_capabilities(self, model_name: str, model_config: Any) -> None:
-        caps = resolve_estimator_capabilities(model_config)
-        for metric in self.config.metrics:
-            spec = get_metric_spec(metric)
-            if (
-                spec.response_method == "proba"
-                and not self.config.calibration.enabled
-                and not caps.has_response("predict_proba")
-            ):
+        if spec.family in CLASSICAL_FAMILIES:
+            est_cls = get_estimator_cls(spec.name)
+            if hasattr(config, "params"):
+                params = config.params
+            elif isinstance(config, dict):
+                params = config.get("params", {})
+            else:
+                params = config.model_dump(exclude={"method", "kind"})
+            try:
+                return est_cls(**params)
+            except Exception as e:
                 raise ValueError(
-                    f"Metric '{metric}' requires predict_proba, but model "
-                    f"'{model_name}' doesn't provide it."
-                )
+                    f"Failed to instantiate model '{model_name}': {e}"
+                ) from e
 
-    def _instantiate_model(self, name: str, config: Any) -> BaseEstimator:
-        kind = getattr(config, "kind", None)
-        if kind == "classical":
-            est_cls = get_estimator_cls(canonical_estimator_name(config.estimator))
-            return est_cls(**config.params)
-        if kind == "frozen_backbone":
-            from .neural import FrozenBackboneDecoder
+        if spec.family == "foundation":
+            from .fm_hub import build_foundation_model
 
-            return FrozenBackboneDecoder(config.backbone, config.head, self.config.task)
-        if kind == "neural_finetune":
-            from .neural import NeuralFineTuneEstimator
+            return build_foundation_model(config)
 
-            return NeuralFineTuneEstimator(
-                **config.model_dump(exclude={"kind"}), task=self.config.task
-            )
-        if kind == "foundation_embedding":
-            from .embedding_extractors import build_embedding_extractor
-
-            return build_embedding_extractor(config)
-        if kind == "temporal":
+        if spec.family == "temporal":
+            # wrapper is 'sliding' or 'generalizing'
+            wrapper = _get_val(config, "wrapper")
             method = (
-                "SlidingEstimator"
-                if config.wrapper == "sliding"
-                else "GeneralizingEstimator"
+                "SlidingEstimator" if wrapper == "sliding" else "GeneralizingEstimator"
             )
             est_cls = get_estimator_cls(method)
-            params = config.model_dump(exclude={"kind", "wrapper", "base"})
+
+            if hasattr(config, "model_dump"):
+                params = config.model_dump(exclude={"kind", "wrapper", "base"})
+            elif isinstance(config, dict):
+                params = {
+                    k: v
+                    for k, v in config.items()
+                    if k not in {"kind", "wrapper", "base"}
+                }
+            else:
+                params = {}
+
             params["base_estimator"] = self._prepare_estimator(
-                f"{name}_base", config.base
+                f"{model_name}_base", _get_val(config, "base")
             )
-            return est_cls(**params)
-        est_cls = get_estimator_cls(config.method)
-        params = config.model_dump(exclude={"method"})
+            try:
+                return est_cls(**params)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to instantiate model '{model_name}': {e}"
+                ) from e
+
+        # Fallback for other registry-based estimators
+        method = _get_val(config, "method")
+        est_cls = get_estimator_cls(method)
+        if hasattr(config, "model_dump"):
+            params = config.model_dump(exclude={"method", "kind"})
+        elif isinstance(config, dict):
+            params = {k: v for k, v in config.items() if k not in {"method", "kind"}}
+        else:
+            params = {}
+
         if "base_estimator" in params:
             params["base_estimator"] = self._prepare_estimator(
-                f"{name}_base", params["base_estimator"]
+                f"{model_name}_base", _get_val(config, "base")
             )
         return est_cls(**params)
 
     def _create_fs_step(self, estimator: BaseEstimator) -> Optional[tuple]:
+        """Create a feature selection step compatible with the chosen model."""
         fs_conf = self.config.feature_selection
         if fs_conf.method == "k_best":
             score_func = (
@@ -367,30 +342,23 @@ class Experiment:
                 SelectKBest(score_func=score_func, k=fs_conf.n_features or "all"),
             )
         if fs_conf.method == "sfs":
-            cv = get_cv_splitter(
-                self._resolved_feature_selection_cv(), require_groups=False
+            cv = get_cv_splitter(fs_conf.cv, require_groups=False)
+            scoring = (
+                fs_conf.scoring or self.config.tuning.scoring or self.config.metrics[0]
             )
-            return (
-                "fs",
-                SequentialFeatureSelector(
-                    estimator=clone(estimator),
-                    n_features_to_select=fs_conf.n_features,
-                    direction=fs_conf.direction,
-                    cv=cv,
-                    scoring=self._resolve_fs_scoring(),
-                    n_jobs=self.config.n_jobs,
-                ),
+            sfs = GroupedSequentialFeatureSelector(
+                estimator=clone(estimator),
+                n_features_to_select=fs_conf.n_features,
+                direction=fs_conf.direction,
+                cv=cv,
+                scoring=scoring,
+                n_jobs=self.config.n_jobs,
             )
+            return ("fs", sfs)
         return None
 
-    def _resolve_fs_scoring(self) -> str:
-        return (
-            self.config.feature_selection.scoring
-            or self.config.tuning.scoring
-            or self.config.metrics[0]
-        )
-
-    def _wrap_with_tuning(self, estimator: BaseEstimator, name: str) -> BaseEstimator:
+    def _wrap_with_tuning(self, name: str, estimator: BaseEstimator) -> BaseEstimator:
+        """Wrap an estimator with hyperparameter search (GridSearch/RandomSearch)."""
         from sklearn.model_selection import GridSearchCV, RandomizedSearchCV
 
         grid = self.config.grids[name]
@@ -399,7 +367,7 @@ class Experiment:
         invals = [k for k in mapped if k not in valid]
         if invals:
             raise ValueError(f"Invalid tuning keys for '{name}': {invals}")
-        cv = get_cv_splitter(self._resolved_tuning_cv(), require_groups=False)
+        cv = get_cv_splitter(self.config.tuning.cv, require_groups=False)
         kwargs = {
             "estimator": estimator,
             "cv": cv,
@@ -428,7 +396,61 @@ class Experiment:
         inferential_unit: Optional[str] = None,
         time_axis: Optional[Sequence[Any]] = None,
     ) -> ExperimentResult:
-        """Execute the full experiment pipeline."""
+        """
+        Execute the complete decoding experiment pipeline.
+
+        This method orchestrates the full scientific workflow:
+        1. Resolves and validates data hierarchy (metadata, groups, sample IDs).
+        2. Aligns temporal dimensions and feature names.
+        3. Performs model-by-model evaluation using stratified/grouped cross-validation.
+        4. Aggregates results into a unified ExperimentResult object.
+        5. Performs statistical assessment (permutations/bootstrapping) if enabled.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            The input data. Can be 2D (samples x features) or 3D temporal
+            (samples x sensors x time).
+        y : Union[pd.Series, np.ndarray]
+            The target labels or values.
+        groups : Union[pd.Series, np.ndarray], optional
+            Grouping labels for grouped cross-validation (e.g., subject IDs).
+        feature_names : Sequence[str], optional
+            Human-readable names for features. Auto-generated if None.
+        sample_ids : Sequence[Any], optional
+            Unique identifiers for each sample. Auto-generated if None.
+        sample_metadata : Union[pd.DataFrame, Dict], optional
+            Additional scientific context for each sample (BIDS-like).
+        observation_level : str, default='sample'
+            Level of the input rows ('sample' or 'epoch').
+        inferential_unit : str, optional
+            The level of statistical independence ('sample' or 'subject').
+        time_axis : Sequence[Any], optional
+            Scientific time points for 3D temporal data.
+
+        Returns
+        -------
+        ExperimentResult
+            A container holding all raw results, metrics, and diagnostics.
+
+        Raises
+        ------
+        ValueError
+            If input lengths mismatch, data is empty, or configuration
+            is scientifically invalid (e.g. regression with stratification).
+
+        Examples
+        --------
+        >>> from coco_pipe.decoding import Experiment, ExperimentConfig
+        >>> config = ExperimentConfig(
+        ...     task="classification", models={"lr": {"kind": "classical"}}
+        ... )
+        >>> result = Experiment(config).run(X, y)
+
+        See Also
+        --------
+        ExperimentResult.get_predictions : Tidy prediction accessor.
+        """
         start_time = time.time()
         logger.info(f"Starting Experiment: Task={self.config.task}")
         X, y = np.asarray(X), np.asarray(y)
@@ -437,33 +459,112 @@ class Experiment:
         if len(y) != len(X):
             raise ValueError("Length mismatch between X and y.")
 
+        # 1. Scientific Guard: Double-Normalization Warning
+        if self.config.use_scaler and X.ndim == 2:
+            # Simple heuristic: if means are near 0 and stds are near 1, warn.
+            means = np.nanmean(X, axis=0)
+            stds = np.nanstd(X, axis=0)
+            if np.all(np.abs(means) < 1e-3) and np.all(np.abs(stds - 1.0) < 1e-2):
+                logger.warning(
+                    "Input data X appears to be already normalized "
+                    "(means ~0, stds ~1). Enabling 'use_scaler' will "
+                    "result in redundant double-normalization."
+                )
+
         self._feature_names = self._resolve_feature_names(X, feature_names)
         self._sample_ids = self._resolve_sample_ids(len(X), sample_ids)
         if observation_level not in {"sample", "epoch"}:
             raise ValueError("observation_level must be 'sample' or 'epoch'.")
-        self._sample_metadata = self._resolve_sample_metadata(len(X), sample_metadata)
-        self._sample_metadata, groups = self._resolve_group_metadata(
-            len(X), self._sample_metadata, groups
+        self._observation_level = observation_level
+        self._sample_metadata, groups = self._resolve_metadata_and_groups(
+            len(X), sample_metadata, groups
         )
-        self._observation_level, self._inferential_unit = (
-            observation_level,
-            self._resolve_inferential_unit(
-                observation_level, inferential_unit, self._sample_metadata
-            ),
-        )
-        self._time_axis = self._resolve_time_axis(X, time_axis)
 
-        self._validate_input_capabilities(X)
-        self._validate_groups_for_cv(groups)
+        # 3. Resolve Inferential Unit (Level of statistical independence)
+        if inferential_unit is not None:
+            self._inferential_unit = inferential_unit
+        elif (
+            observation_level == "epoch" and "Subject" in self._sample_metadata.columns
+        ):
+            self._inferential_unit = "subject"
+        else:
+            self._inferential_unit = "sample"
+
+        # 4. Resolve Time Axis
+        if X.ndim == 3:
+            if time_axis is None:
+                self._time_axis = np.arange(X.shape[-1])
+            else:
+                self._time_axis = np.asarray(time_axis)
+                if len(self._time_axis) != X.shape[-1]:
+                    raise ValueError(
+                        f"time_axis length mismatch: {len(self._time_axis)} vs "
+                        f"{X.shape[-1]}"
+                    )
+        else:
+            self._time_axis = np.asarray(time_axis) if time_axis is not None else None
+
+        # 5. Input Rank Capability Guard
+        rank = "3d_temporal" if X.ndim == 3 else "2d"
+
+        # 6. Group Validation: Early check before entering model loop
+        if groups is None:
+            from ._constants import GROUP_CV_STRATEGIES
+
+            cv_configs = [self.config.cv]
+            if self.config.tuning.enabled and self.config.tuning.cv:
+                cv_configs.append(self.config.tuning.cv)
+            if (
+                self.config.feature_selection.enabled
+                and self.config.feature_selection.cv
+            ):
+                cv_configs.append(self.config.feature_selection.cv)
+            if self.config.calibration.enabled and self.config.calibration.cv:
+                cv_configs.append(self.config.calibration.cv)
+
+            for cv_conf in cv_configs:
+                if cv_conf.strategy in GROUP_CV_STRATEGIES:
+                    raise ValueError(
+                        f"Strategy '{cv_conf.strategy}' requires groups, but none "
+                        "were provided."
+                    )
+
+        for name, caps in self._model_capabilities.items():
+            if rank not in caps.input_ranks:
+                raise ValueError(f"Model '{name}' doesn't support rank '{rank}'.")
+        if self.config.feature_selection.enabled:
+            sel = get_selector_capabilities(self.config.feature_selection.method)
+            if rank not in sel.input_ranks:
+                raise ValueError(
+                    f"FS method '{sel.method}' doesn't support rank '{rank}'."
+                )
         if self.config.task == "classification" and type_of_target(y) == "continuous":
             raise ValueError("Task is 'classification' but target is 'continuous'.")
 
         for name, cfg in self.config.models.items():
-            logger.info(f"Evaluating Model: {name} ({self._model_label(cfg)})")
+            label = getattr(cfg, "method", getattr(cfg, "kind", "Unknown"))
+            logger.info(f"Evaluating Model: {name} ({label})")
             try:
+                # 1. Resolve Spec & Capabilities
+                from .registry import resolve_estimator_spec
+
+                spec = resolve_estimator_spec(cfg)
+
+                # 2. Parallelism Safety
+                is_fm = spec.family in {"foundation", "neural"}
+                model_n_jobs = 1 if is_fm else self.config.n_jobs
+
                 est = self._prepare_estimator(name, cfg)
                 self.results[name] = self._cross_validate(
-                    est, X, y, groups, self._sample_ids, self._sample_metadata
+                    est,
+                    X,
+                    y,
+                    groups,
+                    self._sample_ids,
+                    self._sample_metadata,
+                    n_jobs=model_n_jobs,
+                    spec=spec,
+                    model_name=name,
                 )
             except Exception as e:
                 logger.error(f"Failed model '{name}': {e}", exc_info=True)
@@ -510,16 +611,28 @@ class Experiment:
         y: np.ndarray,
         groups: Optional[np.ndarray],
         sample_ids: np.ndarray,
-        sample_metadata: Optional[pd.DataFrame],
+        sample_metadata: pd.DataFrame,
+        n_jobs: int = 1,
+        spec: Optional[Any] = None,
+        model_name: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Perform parallel cross-validation for a single estimator."""
         cv = get_cv_splitter(self.config.cv, groups=groups, y=y)
         splits = list(cv.split(X, y, groups))
-        est = clone(estimator)
-        force_serial = self.config.n_jobs != 1
 
-        parallel = joblib.Parallel(
-            n_jobs=self.config.n_jobs, verbose=self.config.verbose
-        )
+        for train_idx, test_idx in splits:
+            _validate_fold_integrity(y[train_idx], y[test_idx], spec.task)
+
+        est = clone(estimator)
+
+        meta_dict = None
+        if sample_metadata is not None:
+            meta_dict = {
+                col: sample_metadata[col].values for col in sample_metadata.columns
+            }
+
+        # 4. Execute Parallel CV
+        parallel = joblib.Parallel(n_jobs=n_jobs, verbose=self.config.verbose)
         results = parallel(
             joblib.delayed(fit_and_score_fold)(
                 clone(est),
@@ -527,14 +640,21 @@ class Experiment:
                 y,
                 groups,
                 sample_ids,
-                sample_metadata,
+                meta_dict,
                 train_idx,
                 test_idx,
-                metrics=self.config.metrics,
+                metrics=self.config.get_all_evaluation_metrics(),
                 feature_selection_config=self.config.feature_selection,
                 calibration_config=self.config.calibration,
+                spec=spec,
+                tuning_config=self.config.tuning,
                 feature_names=self._feature_names,
-                force_serial=force_serial,
+                search_enabled=(
+                    self.config.tuning.enabled
+                    and self.config.grids is not None
+                    and model_name in self.config.grids
+                ),
+                force_serial=(n_jobs == 1),
             )
             for train_idx, test_idx in splits
         )
@@ -551,10 +671,14 @@ class Experiment:
             for m, s in res["scores"].items():
                 fold_scores[m].append(s)
 
-        metrics = {
-            m: {"mean": np.nanmean(s), "std": np.nanstd(s), "folds": s}
-            for m, s in fold_scores.items()
-        }
+        metrics = {}
+        for m, s in fold_scores.items():
+            if np.isnan(s).any():
+                logger.warning(
+                    f"NaN score detected in one or more folds for metric '{m}'. "
+                    "This usually indicates a model failure or degenerate test fold."
+                )
+            metrics[m] = {"mean": np.nanmean(s), "std": np.nanstd(s), "folds": s}
         valid_imps = [f for f in f_imps if f is not None]
         agg_imp = None
         if valid_imps and all(imp.shape == valid_imps[0].shape for imp in valid_imps):
@@ -563,10 +687,13 @@ class Experiment:
                 "mean": np.mean(stack, axis=0),
                 "std": np.std(stack, axis=0),
                 "raw": stack,
-                "feature_names": self._metadata_feature_names(stack.shape[1]),
+                "feature_names": self._feature_names
+                if len(self._feature_names) == stack.shape[1]
+                else [f"feature_{idx}" for idx in range(stack.shape[1])],
             }
 
         return {
+            "status": "success",
             "metrics": metrics,
             "predictions": f_preds,
             "indices": f_idx,
@@ -578,6 +705,7 @@ class Experiment:
 
     @staticmethod
     def _resolve_sample_ids(n: int, ids: Optional[Sequence[Any]]) -> np.ndarray:
+        """Ensure sample IDs are provided and have correct length."""
         if ids is None:
             return np.arange(n)
         ids = np.asarray(ids)
@@ -587,60 +715,77 @@ class Experiment:
             raise ValueError("sample_ids must be unique.")
         return ids
 
-    @staticmethod
-    def _resolve_sample_metadata(
-        n: int, meta: Optional[Union[pd.DataFrame, Dict[str, Sequence[Any]]]]
-    ) -> Optional[pd.DataFrame]:
-        if meta is None:
-            return None
-        df = pd.DataFrame(meta).reset_index(drop=True)
-        if len(df) != n:
-            raise ValueError("sample_metadata length mismatch.")
-        miss = sorted({"subject", "session"} - set(df.columns))
-        if miss:
-            raise ValueError(f"sample_metadata missing {miss}.")
-        if "site" not in df.columns:
-            df["site"] = None
-        return df
+    def _resolve_metadata_and_groups(
+        self,
+        n: int,
+        meta_in: Optional[Union[pd.DataFrame, Dict[str, Sequence[Any]]]],
+        groups_in: Optional[np.ndarray],
+    ) -> tuple[pd.DataFrame, Optional[np.ndarray]]:
+        """Validate metadata and extract cross-validation groups if required."""
+        # 1. Standardize Metadata to DataFrame
+        if meta_in is None:
+            meta = pd.DataFrame(index=range(n))
+        else:
+            meta = pd.DataFrame(meta_in).reset_index(drop=True)
+            meta.columns = [str(c).capitalize() for c in meta.columns]
+            if len(meta) != n:
+                raise ValueError(f"sample_metadata length mismatch: {len(meta)} vs {n}")
 
-    def _resolve_group_metadata(
-        self, n: int, meta: Optional[pd.DataFrame], groups: Optional[np.ndarray]
-    ) -> tuple:
+        # 2. Scientific Guard: Metadata Requirements
+        # We must track subject and session to ensure independent validation
+        # and prevent pseudoreplication, especially for epoch-level data.
+        if meta_in is not None:
+            missing = [c for c in ["Subject", "Session"] if c not in meta.columns]
+            if missing:
+                raise ValueError(
+                    f"sample_metadata must include Subject and Session for "
+                    f"proper independence tracking. Missing: {missing}"
+                )
+
+        # 2. Resolve Groups
+        gv = None
         key = self.config.cv.group_key
-        if groups is not None:
-            gv = np.asarray(groups)
+        has_grouped_cv = (
+            self.config.cv.strategy in GROUP_CV_STRATEGIES
+            or (
+                self.config.tuning.enabled
+                and self.config.tuning.cv.strategy in GROUP_CV_STRATEGIES
+            )
+            or (
+                self.config.calibration.enabled
+                and self.config.calibration.cv.strategy in GROUP_CV_STRATEGIES
+            )
+        )
+
+        # Case A: Explicit groups array provided
+        if groups_in is not None:
+            gv = np.asarray(groups_in)
             if len(gv) != n:
-                raise ValueError("groups length mismatch.")
+                raise ValueError(f"groups length mismatch: {len(gv)} vs {n}")
             if key is not None:
-                if meta is None:
-                    meta = pd.DataFrame({key: gv})
-                elif key not in meta:
-                    meta[key] = gv
-            return meta, gv
-        if key is not None:
-            if meta is None or key not in meta:
-                raise ValueError(f"group_key '{key}' missing.")
-            return meta, meta[key].to_numpy()
-        return meta, None
+                meta[key] = gv
 
-    def _resolve_inferential_unit(
-        self, level: str, unit: Optional[str], meta: Optional[pd.DataFrame]
-    ) -> str:
-        if unit is not None:
-            return unit
-        return "subject" if level == "epoch" and meta is not None else "sample"
+        # Case B: Extract from metadata using group_key
+        elif key is not None:
+            if key not in meta.columns:
+                raise ValueError(f"group_key '{key}' not found in sample_metadata.")
+            gv = meta[key].to_numpy()
 
-    def _resolve_time_axis(
-        self, X: np.ndarray, axis: Optional[Sequence[Any]]
-    ) -> Optional[np.ndarray]:
-        if X.ndim != 3:
-            return np.asarray(axis) if axis is not None else None
-        if axis is None:
-            return np.arange(X.shape[-1])
-        axis = np.asarray(axis)
-        if len(axis) != X.shape[-1]:
-            raise ValueError("time_axis length mismatch.")
-        return axis
+        # Validation: Grouped strategies with only 1 group will fail in sklearn
+        if has_grouped_cv:
+            if gv is None:
+                raise ValueError(
+                    f"CV strategy '{self.config.cv.strategy}' requires groups "
+                    "via 'groups' parameter or 'group_key' in config."
+                )
+            unique_groups = len(pd.unique(gv))
+            if unique_groups < 2:
+                raise ValueError(
+                    f"Grouped CV requires at least 2 unique groups, but found "
+                    f"only {unique_groups}. Check your sample_metadata or "
+                    "groups array."
+                )
+        return meta, gv
 
     def _build_result_meta(
         self, X: np.ndarray, t_axis: Optional[np.ndarray]
@@ -652,13 +797,14 @@ class Experiment:
                 "task": self.config.task,
                 "n_samples": int(X.shape[0]),
                 "n_features": int(X.shape[1]) if X.ndim > 1 else 1,
-                "observation_level": getattr(self, "_observation_level", "sample"),
-                "inferential_unit": getattr(self, "_inferential_unit", "sample"),
+                "observation_level": self._observation_level,
+                "inferential_unit": self._inferential_unit,
+                "sample_metadata_columns": self._sample_metadata.columns.tolist(),
                 "run_manifest": {
                     "schema_version": RESULT_SCHEMA_VERSION,
                     "model_names": list(self.config.models),
                     "cv_strategy": self.config.cv.strategy,
-                    "metrics": list(self.config.metrics),
+                    "metrics": self.config.get_all_evaluation_metrics(),
                 },
                 "hardware_provenance": {"n_jobs": self.config.n_jobs},
                 "capabilities": self._capability_payload(),
@@ -684,98 +830,9 @@ class Experiment:
                     "response_method": get_metric_spec(m).response_method,
                     "family": get_metric_spec(m).family,
                 }
-                for m in self.config.metrics
+                for m in self.config.get_all_evaluation_metrics()
             },
         }
-
-    def _validate_input_capabilities(self, X: np.ndarray) -> None:
-        rank = "3d_temporal" if X.ndim == 3 else "2d"
-        for n, c in self._model_capabilities.items():
-            if rank not in c.input_ranks:
-                raise ValueError(f"Model '{n}' doesn't support rank '{rank}'.")
-        if self.config.feature_selection.enabled:
-            sel = get_selector_capabilities(self.config.feature_selection.method)
-            if rank not in sel.input_ranks:
-                raise ValueError(
-                    f"FS method '{sel.method}' doesn't support rank '{rank}'."
-                )
-
-    def _validate_groups_for_cv(self, groups: Optional[np.ndarray]) -> None:
-        if (
-            self.config.cv.strategy in GROUP_CV_STRATEGIES
-            and not self.config.cv.group_key
-        ):
-            raise ValueError(
-                f"Strategy '{self.config.cv.strategy}' requires group_key."
-            )
-        if groups is not None:
-            return
-        if self.config.cv.strategy in GROUP_CV_STRATEGIES:
-            raise ValueError("Outer CV requires groups.")
-        if (
-            self.config.tuning.enabled
-            and self._resolved_tuning_cv().strategy in GROUP_CV_STRATEGIES
-        ):
-            raise ValueError("Tuning CV requires groups.")
-
-    def save_results(self, path: Optional[Union[str, Path]] = None):
-        if path is None:
-            path = self.config.output_dir
-            if path is None:
-                raise ValueError("No output path specified.")
-        path = Path(path)
-
-        if self.result_ is not None:
-            res_obj = self.result_
-        else:
-            res_obj = ExperimentResult(
-                self.results,
-                config=self.config.model_dump(),
-                meta=get_environment_info(),
-                schema_version=RESULT_SCHEMA_VERSION,
-            )
-
-        if path.suffix == "":
-            path.mkdir(parents=True, exist_ok=True)
-            target = (
-                path
-                / f"{self.config.tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
-            )
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            target = path
-
-        logger.info(f"Saving results to {target}")
-        if target.suffix == ".json":
-            res_obj.save_json(target)
-        else:
-            joblib.dump(res_obj.to_payload(), target)
-        return target
-
-    @staticmethod
-    def load_results(path: Union[str, Path]) -> ExperimentResult:
-        path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(f"Result file not found: {path}")
-
-        if path.suffix == ".json":
-            return ExperimentResult.load_json(path)
-
-        payload = joblib.load(path)
-        return ExperimentResult(
-            payload["results"],
-            config=payload.get("config"),
-            meta=payload.get("meta"),
-            schema_version=payload.get("schema_version", RESULT_SCHEMA_VERSION),
-        )
-
-    def _metadata_feature_names(self, n: int) -> list[str]:
-        names = getattr(self, "_feature_names", None)
-        return (
-            list(names)
-            if names is not None and len(names) == n
-            else [f"feature_{idx}" for idx in range(n)]
-        )
 
     def _resolve_feature_names(
         self, X: np.ndarray, names: Optional[Sequence[str]]
@@ -793,9 +850,22 @@ class Experiment:
             else [f"feature_{idx}" for idx in range(X.shape[1])]
         )
 
-    def _evaluation_metrics(self) -> list[str]:
-        eval_cfg = self.config.evaluation
-        ms = []
-        if eval_cfg.metrics:
-            ms.extend(eval_cfg.metrics)
-        return sorted(set(ms))
+
+def _validate_fold_integrity(
+    y_train: np.ndarray, y_test: np.ndarray, tasks: tuple
+) -> None:
+    """Check if CV folds are degenerate before fitting."""
+    if y_train.size == 0 or y_test.size == 0:
+        raise ValueError("Empty fold detected.")
+
+    if np.min(y_train) == np.max(y_train):
+        raise ValueError(
+            f"Degenerate Train Fold: Only one value found ({y_train[0]}). "
+            "Scoring metrics are undefined for constant targets."
+        )
+
+    if "classification" in tasks and np.min(y_test) == np.max(y_test):
+        raise ValueError(
+            f"Degenerate Test Fold: Only one class found ({y_test[0]}). "
+            "Metrics like ROC-AUC are undefined for single-class test sets."
+        )

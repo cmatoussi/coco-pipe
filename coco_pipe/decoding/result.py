@@ -7,17 +7,15 @@ from typing import Any, Dict, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-from .constants import RESULT_SCHEMA_VERSION
-from .diagnostics import (
-    feature_names_for_result,
-    paired_unit_indices,
+from ._constants import RESULT_SCHEMA_VERSION
+from ._diagnostics import (
+    confusion_matrix_frame,
+    curve_score_groups,
     prediction_rows,
     proba_matrix,
-    resolve_pos_label,
+    scalar_prediction_frame,
     score_rows,
-    unit_indices,
 )
-from .metrics import get_metric_spec
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +23,16 @@ logger = logging.getLogger(__name__)
 class ExperimentResult:
     """
     Unified Container for Experiment Results.
-    Provides Tidy Data views for easier analysis.
+
+    Provides tidy data views for easier analysis, visualization, and
+    statistical assessment of decoding performance across multiple models,
+    folds, and temporal coordinates.
+
+    Examples
+    --------
+    >>> result = Experiment(config).run(X, y)
+    >>> summary_df = result.summary()
+    >>> preds_df = result.get_predictions()
     """
 
     def __init__(
@@ -33,53 +40,178 @@ class ExperimentResult:
         raw_results: Dict[str, Any],
         config: Optional[Dict[str, Any]] = None,
         meta: Optional[Dict[str, Any]] = None,
+        time_axis: Optional[Sequence[Any]] = None,
         schema_version: str = RESULT_SCHEMA_VERSION,
     ):
+        """
+        Initialize the ExperimentResult container.
+
+        This object serves as the primary interface for exploring, visualizing,
+        and validating decoding results. It encapsulates raw metrics,
+        predictions, and cross-validation splits into a unified structure.
+
+        Parameters
+        ----------
+        raw_results : dict
+            The raw results dictionary returned by the Experiment engine,
+            keyed by model name.
+        config : dict, optional
+            The configuration dictionary used for the experiment.
+        meta : dict, optional
+            Additional metadata (e.g., sample IDs, unit of inference, versions).
+        time_axis : sequence, optional
+            The scientific time points (e.g., in seconds or ms) corresponding
+            to the temporal coordinates in the results.
+        schema_version : str, optional
+            The version of the result schema for forward compatibility.
+        """
         self.raw = raw_results
         self.config = config or {}
         self.meta = meta or {}
         self.schema_version = schema_version
 
-    def to_payload(self) -> Dict[str, Any]:
-        """Return the serializable decoding result payload."""
-        return {
+        # Explicit time axis resolution
+        self._time_axis_cache = None
+        if time_axis is not None:
+            self._time_axis_cache = list(time_axis)
+        elif "time_axis" in self.meta:
+            t = self.meta["time_axis"]
+            self._time_axis_cache = list(t) if t is not None else None
+
+    @property
+    def time_axis(self) -> Optional[list[Any]]:
+        """The scientific time points for temporal decoding results."""
+        return self._time_axis_cache
+
+    def to_payload(self, serializable: bool = False) -> Dict[str, Any]:
+        """
+        Return the result payload for persistence or transmission.
+
+        Converts the internal state into a dictionary containing the schema
+        version, configuration, metadata, and raw model results.
+
+        Parameters
+        ----------
+        serializable : bool, default=False
+            If True, recursively converts all NumPy arrays, integers, floats,
+            and booleans into standard Python primitives (lists, ints, etc.)
+            suitable for JSON serialization.
+
+        Returns
+        -------
+        payload : dict
+            The consolidated result payload.
+
+        See Also
+        --------
+        ExperimentResult.save : Persist results to disk.
+        """
+        payload = {
             "schema_version": self.schema_version,
             "config": self.config,
             "meta": self.meta,
             "results": self.raw,
         }
+        return make_serializable(payload) if serializable else payload
 
-    def save_json(self, path: Union[str, Path, Any], indent: int = 2):
-        """Save results to a JSON file (standard-compliant, cross-version safe)."""
-        import json
+    def save(self, path: Optional[Union[str, Path, Any]] = None, indent: int = 2):
+        """
+        Save results to a file, auto-detecting the format from the extension.
 
-        payload = self.to_payload()
+        Supports both binary formats (via joblib) for speed and disk space,
+        and JSON format for interoperability and human-readability.
 
-        def _to_serializable(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            if isinstance(obj, (np.int64, np.int32, np.int16)):
-                return int(obj)
-            if isinstance(obj, (np.float64, np.float32)):
-                return float(obj)
-            if isinstance(obj, dict):
-                return {str(k): _to_serializable(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple)):
-                return [_to_serializable(v) for v in obj]
-            if hasattr(obj, "model_dump"):
-                return obj.model_dump()
-            return obj
+        Parameters
+        ----------
+        path : str or Path, optional
+            The destination path.
+            - If None, uses 'output_dir' from the experiment config.
+            - If a directory, generates a timestamped filename with a '.pkl' extension.
+            - If a file path ending in '.json', performs JSON serialization.
+            - Otherwise, uses joblib binary serialization.
+        indent : int, default=2
+            JSON indentation level (only applicable for .json files).
 
-        with open(path, "w") as f:
-            json.dump(_to_serializable(payload), f, indent=indent)
+        Returns
+        -------
+        path : Path
+            The path where the results were saved.
+
+        See Also
+        --------
+        ExperimentResult.load : Load results from disk.
+        Experiment.save_results : Experiment-level wrapper.
+        """
+        from datetime import datetime
+
+        if path is None:
+            path = self.config.get("output_dir", ".")
+
+        path = Path(path)
+        if path.suffix == "" or path.is_dir():
+            path.mkdir(parents=True, exist_ok=True)
+            tag = self.config.get("tag", "result")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = path / f"{tag}_{ts}.pkl"
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+        if path.suffix == ".json":
+            import json
+
+            payload = self.to_payload(serializable=True)
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=indent)
+        else:
+            import joblib
+
+            joblib.dump(self.to_payload(), path)
+
+        return path
 
     @classmethod
-    def load_json(cls, path: Union[str, Path, Any]) -> "ExperimentResult":
-        """Load results from a JSON file."""
-        import json
+    def load(cls, path: Union[str, Path, Any]) -> "ExperimentResult":
+        """
+        Load results from a file (auto-detects JSON or Pickle).
 
-        with open(path, "r") as f:
-            payload = json.load(f)
+        Reconstructs an ExperimentResult instance from a previously saved
+        payload on disk.
+
+        Parameters
+        ----------
+        path : str or Path
+            The path to the result file.
+
+        Returns
+        -------
+        result : ExperimentResult
+            The rehydrated result container.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the specified path does not exist.
+        ValueError
+            If the file format is unrecognized or corrupted.
+
+        See Also
+        --------
+        ExperimentResult.save : Persist results to disk.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Result file not found: {path}")
+
+        if path.suffix == ".json":
+            import json
+
+            with open(path, "r") as f:
+                payload = json.load(f)
+        else:
+            import joblib
+
+            payload = joblib.load(path)
+
         return cls(
             raw_results=payload["results"],
             config=payload.get("config"),
@@ -88,28 +220,100 @@ class ExperimentResult:
         )
 
     def summary(self) -> pd.DataFrame:
-        """Get a high-level summary of performance (Mean/Std across folds)."""
+        """
+        Get a high-level summary of performance (Mean/Std and Stats).
+
+        Aggregates results across all models and folds into a single
+        benchmarking table.
+
+        Scientific Rationale
+        --------------------
+        A summary table provides a concise overview of model performance
+        expectations and their reliability. By including standard deviations
+        and p-values alongside means, it allows for immediate identification
+        of significant decoding effects and model stability.
+
+        Returns
+        -------
+        summary_df : pd.DataFrame
+            DataFrame with models as index and scalar metrics as columns.
+            Includes p-values and significance markers ('*') if statistical
+            assessments were executed.
+
+        Examples
+        --------
+        >>> # df = result.summary()
+        >>> # print(df[['accuracy_mean', 'accuracy_p_val']])
+
+        See Also
+        --------
+        ExperimentResult.get_detailed_scores : Get fold-level results.
+        ExperimentResult.get_temporal_score_summary : Temporal-resolved summary.
+        """
         rows = []
         for model, res in self.raw.items():
             if "error" in res:
                 continue
+
+            # 1. Performance Metrics
             row = {"Model": model}
-            for metric, stats in res["metrics"].items():
+            for metric, stats in res.get("metrics", {}).items():
                 mean = np.asarray(stats["mean"])
                 std = np.asarray(stats["std"])
                 if mean.ndim == 0 and std.ndim == 0:
                     row[f"{metric}_mean"] = float(mean)
                     row[f"{metric}_std"] = float(std)
+
+            # 2. Statistical Assessment (if available)
+            stats_rows = res.get("statistical_assessment", [])
+            for s in stats_rows:
+                # Only include scalar stats (where Time/TrainTime are None)
+                if s.get("Time") is None and s.get("TrainTime") is None:
+                    m = s.get("Metric")
+                    p_val = s.get("PValue")
+                    if p_val is not None:
+                        row[f"{m}_p_val"] = p_val
+                        # Add significance marker
+                        if s.get("Significant"):
+                            row[f"{m}_sig"] = "*"
+
             if len(row) > 1:
                 rows.append(row)
+
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(rows).set_index("Model")
 
-    def get_detailed_scores(self) -> pd.DataFrame:
-        """Get fold-level scores for all models in long format."""
+        df = pd.DataFrame(rows).set_index("Model")
+        # Sort columns to group Mean/Std/P-val together for each metric
+        cols = sorted(df.columns)
+        return df[cols]
+
+    def get_detailed_scores(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get fold-level scores for all models or a specific model in long format.
+
+        Expands results into a 'tidy' format where each row represents a
+        single score for one fold, model, and metric.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by. Default is None (all models).
+
+        Returns
+        -------
+        scores_df : pd.DataFrame
+            Tidy DataFrame with columns: Model, Fold, Metric, and Value.
+            Includes temporal coordinates if the data is time-resolved.
+
+        See Also
+        --------
+        ExperimentResult.summary : Mean/Std aggregate view.
+        """
         rows = []
-        for model, res in self.raw.items():
+        target_models = [model] if model is not None else self.raw.keys()
+        for m_name in target_models:
+            res = self.raw.get(m_name, {})
             if "error" in res:
                 continue
             metrics_data = res["metrics"]
@@ -118,23 +322,67 @@ class ExperimentResult:
                 for metric, stats in metrics_data.items():
                     rows.extend(
                         score_rows(
-                            model,
+                            m_name,
                             fold_idx,
                             metric,
                             stats["folds"][fold_idx],
-                            time_axis=self._time_axis(),
+                            time_axis=self.time_axis,
                         )
                     )
         return pd.DataFrame(rows)
 
-    def get_temporal_score_summary(self) -> pd.DataFrame:
-        """Get temporal metric means/stds across folds in long format."""
-        rows = []
-        columns = ["Model", "Metric", "Time", "TrainTime", "TestTime", "Mean", "Std"]
+    def get_temporal_score_summary(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get temporal metric means/stds and significance across folds.
 
-        for model, res in self.raw.items():
+        Averages performance metrics across cross-validation folds for each
+        temporal coordinate (Time or TrainTime/TestTime pair).
+
+        Scientific Rationale
+        --------------------
+        Temporal decoding and time-generalization analysis yield multi-dimensional
+        performance arrays. Aggregating these across folds provides an estimate of
+        the central tendency and variance of the model's ability to decode at
+        specific latency points. Integrating p-values into this view allows for
+        the identification of 'significant' time windows.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by. Default is None (all models).
+
+        Returns
+        -------
+        summary_df : pd.DataFrame
+            DataFrame in long format with Model, Metric, Time coordinates,
+            Mean, Std, and PValue/Significant columns if statistical
+            assessments were executed.
+
+        See Also
+        --------
+        ExperimentResult.summary : Scalar-only summary view.
+        ExperimentResult.get_generalization_matrix : 2D matrix view of TG results.
+        """
+        rows = []
+        columns = [
+            "Model",
+            "Metric",
+            "Time",
+            "TrainTime",
+            "TestTime",
+            "Mean",
+            "Std",
+            "PValue",
+            "Significant",
+        ]
+
+        target_models = [model] if model is not None else self.raw.keys()
+        for m_name in target_models:
+            res = self.raw.get(m_name, {})
             if "error" in res:
                 continue
+
+            # 1. Base Metrics (Mean/Std across folds)
             for metric, stats in res.get("metrics", {}).items():
                 folds = [np.asarray(fold) for fold in stats.get("folds", [])]
                 if not folds or folds[0].ndim == 0:
@@ -143,51 +391,114 @@ class ExperimentResult:
                 mean = np.nanmean(stack, axis=0)
                 std = np.nanstd(stack, axis=0)
 
+                # Prepare stats lookup for this model/metric
+                # Using a dict for O(1) lookup: (Time) or (TrainTime, TestTime) -> row
+                stats_rows = res.get("statistical_assessment", [])
+                stats_lookup = {}
+                for s in stats_rows:
+                    if s.get("Metric") == metric:
+                        key = (s.get("Time"), s.get("TrainTime"), s.get("TestTime"))
+                        stats_lookup[key] = s
+
                 if mean.ndim == 1:
                     for t_idx, val in enumerate(mean):
+                        t_val = self._time_value(t_idx)
+                        s_row = stats_lookup.get((t_val, None, None), {})
                         rows.append(
                             {
-                                "Model": model,
+                                "Model": m_name,
                                 "Metric": metric,
-                                "Time": self._time_value(t_idx),
+                                "Time": t_val,
                                 "Mean": val,
                                 "Std": std[t_idx],
+                                "PValue": s_row.get("PValue"),
+                                "Significant": s_row.get("Significant", False),
                             }
                         )
                 elif mean.ndim == 2:
                     for t_tr in range(mean.shape[0]):
+                        tr_val = self._time_value(t_tr)
                         for t_te in range(mean.shape[1]):
+                            te_val = self._time_value(t_te)
+                            s_row = stats_lookup.get((None, tr_val, te_val), {})
                             rows.append(
                                 {
-                                    "Model": model,
+                                    "Model": m_name,
                                     "Metric": metric,
-                                    "TrainTime": self._time_value(t_tr),
-                                    "TestTime": self._time_value(t_te),
+                                    "TrainTime": tr_val,
+                                    "TestTime": te_val,
                                     "Mean": mean[t_tr, t_te],
                                     "Std": std[t_tr, t_te],
+                                    "PValue": s_row.get("PValue"),
+                                    "Significant": s_row.get("Significant", False),
                                 }
                             )
         return pd.DataFrame(rows, columns=columns)
 
-    def get_predictions(self) -> pd.DataFrame:
-        """Get concatenated predictions for all models."""
+    def get_predictions(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get concatenated predictions for all models or a specific model.
+
+        Converts nested prediction dictionaries from all folds into a single
+        flattened DataFrame.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by. Default is None (all models).
+
+        Returns
+        -------
+        predictions_df : pd.DataFrame
+            Tidy DataFrame of predictions. Includes SampleID, y_true, y_pred,
+            y_score, and probability columns if available.
+
+        See Also
+        --------
+        ExperimentResult.get_splits : Membership of samples in each fold.
+        """
         rows = []
-        time_axis = self._time_axis()
-        for model, res in self.raw.items():
-            if "error" in res:
+        time_axis = self.time_axis
+        target_models = [model] if model is not None else self.raw.keys()
+
+        for m_name in target_models:
+            res = self.raw.get(m_name, {})
+            if "error" in res or "predictions" not in res:
                 continue
             for fold_idx, preds in enumerate(res["predictions"]):
                 rows.extend(
-                    prediction_rows(model, fold_idx, preds, time_axis=time_axis)
+                    prediction_rows(m_name, fold_idx, preds, time_axis=time_axis)
                 )
         return pd.DataFrame(rows)
 
-    def get_splits(self) -> pd.DataFrame:
-        """Get outer-CV train/test membership in long format."""
-        from .diagnostics import metadata_display_name, optional_values
+    def get_splits(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get outer-CV train/test membership in long format for all models.
 
-        frames = []
-        for model, res in self.raw.items():
+        Tracks which samples were used for training and testing in each fold
+        of the cross-validation procedure.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by. Default is None (all models).
+
+        Returns
+        -------
+        splits_df : pd.DataFrame
+            DataFrame with Model, Fold, Set (train/test), SampleIndex, SampleID,
+            and associated metadata columns (e.g., Subject, Session).
+
+        See Also
+        --------
+        ExperimentResult.get_predictions : Link predictions to splits via SampleID.
+        """
+        from ._diagnostics import optional_values
+
+        all_rows = []
+        target_models = [model] if model is not None else self.raw.keys()
+        for m_name in target_models:
+            res = self.raw.get(m_name, {})
             if "error" in res:
                 continue
             for fold_idx, split in enumerate(res.get("splits", [])):
@@ -212,28 +523,71 @@ class ExperimentResult:
                     if n == 0:
                         continue
 
-                    data = {
-                        "Model": [model] * n,
-                        "Fold": [fold_idx] * n,
-                        "Set": [set_name] * n,
-                        "SampleIndex": indices,
-                        "SampleID": np.asarray(split[id_key]),
-                        "Group": optional_values(split.get(group_key), n),
-                    }
+                    ids = np.asarray(split[id_key])
+                    groups = optional_values(split.get(group_key), n)
                     metadata = split.get(meta_key) or {}
-                    for key, values in metadata.items():
-                        v_arr = np.asarray(values, dtype=object)
-                        data[metadata_display_name(key)] = v_arr[:n]
 
-                    frames.append(pd.DataFrame(data))
+                    # Flatten metadata into columns
+                    meta_arrays = {
+                        k: np.asarray(v, dtype=object)[:n] for k, v in metadata.items()
+                    }
 
-        if not frames:
+                    for i in range(n):
+                        row = {
+                            "Model": m_name,
+                            "Fold": fold_idx,
+                            "Set": set_name,
+                            "SampleIndex": indices[i],
+                            "SampleID": ids[i],
+                            "Group": groups[i],
+                        }
+                        # Add metadata columns
+                        for k, v_arr in meta_arrays.items():
+                            row[k] = v_arr[i]
+                        all_rows.append(row)
+
+        if not all_rows:
             return pd.DataFrame()
 
-        return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(all_rows)
 
-    def get_fit_diagnostics(self) -> pd.DataFrame:
-        """Get fold-level timing and warning diagnostics."""
+    def get_fit_diagnostics(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get fold-level timing and warning diagnostics for all models.
+
+        Aggregates operational metrics such as execution time and runtime
+        warnings encountered during the model fit and predict stages.
+
+        Scientific Rationale
+        --------------------
+        Runtime diagnostics are critical for identifying computational
+        bottlenecks and ensuring model validity. Long training times may
+        suggest the need for dimensionality reduction, while consistent
+        warnings (e.g., convergence failures) can signal that model
+        hyperparameters are poorly suited to the dataset.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by. Default is None (all models).
+
+        Returns
+        -------
+        diagnostics_df : pd.DataFrame
+            DataFrame with Model, Fold, and timing columns (FitTime, PredictTime,
+            ScoreTime, TotalTime). If warnings were captured, includes Stage,
+            WarningCategory, and WarningMessage columns.
+
+        Examples
+        --------
+        >>> diagnostics = result.get_fit_diagnostics()
+        >>> # Identify the slowest model
+        >>> slow_model = diagnostics.groupby("Model")["TotalTime"].mean().idxmax()
+
+        See Also
+        --------
+        ExperimentResult.summary : General performance summary.
+        """
         rows = []
         columns = [
             "Model",
@@ -246,12 +600,14 @@ class ExperimentResult:
             "WarningCategory",
             "WarningMessage",
         ]
-        for model, res in self.raw.items():
+        target_models = [model] if model is not None else self.raw.keys()
+        for m_name in target_models:
+            res = self.raw.get(m_name, {})
             if "error" in res:
                 continue
             for fold_idx, diag in enumerate(res.get("diagnostics", [])):
                 base = {
-                    "Model": model,
+                    "Model": m_name,
                     "Fold": fold_idx,
                     "FitTime": diag.get("fit_time"),
                     "PredictTime": diag.get("predict_time"),
@@ -280,45 +636,94 @@ class ExperimentResult:
                     )
         return pd.DataFrame(rows, columns=columns)
 
+    def _build_confusion_df(
+        self,
+        model: Optional[str],
+        labels: Optional[Sequence[Any]],
+        normalize: Optional[str],
+        group_cols: list[str],
+    ) -> pd.DataFrame:
+        """Shared logic for building confusion matrix DataFrames."""
+        preds = scalar_prediction_frame(self.get_predictions(model=model))
+        if preds.empty:
+            cols = group_cols + ["TrueLabel", "PredictedLabel", "Value"]
+            return pd.DataFrame(columns=cols)
+
+        if labels is None:
+            labels = sorted(
+                pd.unique(pd.concat([preds["y_true"], preds["y_pred"]])).tolist()
+            )
+
+        return confusion_matrix_frame(preds, labels, normalize, group_cols=group_cols)
+
     def get_confusion_matrices(
         self,
         model: Optional[str] = None,
         labels: Optional[Sequence[Any]] = None,
         normalize: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Get fold-level confusion matrices in long format."""
-        from sklearn.metrics import confusion_matrix
+        """
+        Get fold-level confusion matrices in long format.
 
-        preds = self._standard_prediction_frame(model=model)
-        cols = ["Model", "Fold", "TrueLabel", "PredictedLabel", "Value"]
-        rows = []
-        if preds.empty:
-            return pd.DataFrame(rows, columns=cols)
-        if labels is None:
-            labels = sorted(
-                pd.unique(pd.concat([preds["y_true"], preds["y_pred"]])).tolist()
-            )
-        for (m_name, f_idx), group in preds.groupby(["Model", "Fold"]):
-            matrix = confusion_matrix(
-                group["y_true"], group["y_pred"], labels=labels, normalize=normalize
-            )
-            for t_idx, t_label in enumerate(labels):
-                for p_idx, p_label in enumerate(labels):
-                    rows.append(
-                        {
-                            "Model": m_name,
-                            "Fold": f_idx,
-                            "TrueLabel": t_label,
-                            "PredictedLabel": p_label,
-                            "Value": matrix[t_idx, p_idx],
-                        }
-                    )
-        return pd.DataFrame(rows, columns=cols)
+        Computes the confusion between true and predicted labels for each
+        cross-validation fold.
+
+        Scientific Rationale
+        --------------------
+        Confusion matrices provide a granular view of model errors, identifying
+        specific classes that are frequently misidentified. Analyzing these
+        per-fold allows for assessing the consistency of error patterns across
+        different data splits.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by. Default is None (all models).
+        labels : sequence of any, optional
+            The list of labels to use for the matrix axes. If None, uses all
+            labels present in the predictions.
+        normalize : {'true', 'pred', 'all'}, optional
+            Normalization strategy:
+            - 'true': Normalize by true labels (rows).
+            - 'pred': Normalize by predicted labels (columns).
+            - 'all': Normalize by total number of samples.
+
+        Returns
+        -------
+        confusion_df : pd.DataFrame
+            Tidy DataFrame with Model, Fold, TrueLabel, PredictedLabel, and Value.
+
+        See Also
+        --------
+        ExperimentResult.get_pooled_confusion_matrix : Aggregate across folds.
+        """
+        return self._build_confusion_df(
+            model=model,
+            labels=labels,
+            normalize=normalize,
+            group_cols=["Model", "Fold"],
+        )
 
     def get_confusion_counts(
         self, model: Optional[str] = None, labels: Optional[Sequence[Any]] = None
     ) -> pd.DataFrame:
-        """Get unnormalized per-fold confusion counts."""
+        """
+        Get unnormalized per-fold confusion counts.
+
+        Equivalent to `get_confusion_matrices(normalize=None)`.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by.
+        labels : sequence of any, optional
+            The list of labels to use.
+
+        Returns
+        -------
+        counts_df : pd.DataFrame
+            Unnormalized confusion counts.
+        """
         return self.get_confusion_matrices(model=model, labels=labels, normalize=None)
 
     def get_pooled_confusion_matrix(
@@ -327,104 +732,195 @@ class ExperimentResult:
         labels: Optional[Sequence[Any]] = None,
         normalize: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Get pooled out-of-fold confusion matrices in long format."""
-        from sklearn.metrics import confusion_matrix
+        """
+        Get pooled out-of-fold confusion matrices in long format.
 
-        preds = self._standard_prediction_frame(model=model)
-        cols = ["Model", "TrueLabel", "PredictedLabel", "Value"]
-        rows = []
-        if preds.empty:
-            return pd.DataFrame(rows, columns=cols)
-        if labels is None:
-            labels = sorted(
-                pd.unique(pd.concat([preds["y_true"], preds["y_pred"]])).tolist()
-            )
-        for m_name, group in preds.groupby("Model"):
-            matrix = confusion_matrix(
-                group["y_true"], group["y_pred"], labels=labels, normalize=normalize
-            )
-            for t_idx, t_label in enumerate(labels):
-                for p_idx, p_label in enumerate(labels):
-                    rows.append(
-                        {
-                            "Model": m_name,
-                            "TrueLabel": t_label,
-                            "PredictedLabel": p_label,
-                            "Value": matrix[t_idx, p_idx],
-                        }
-                    )
-        return pd.DataFrame(rows, columns=cols)
+        Aggregates predictions from all cross-validation folds before
+        calculating the confusion matrix.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by.
+        labels : sequence of any, optional
+            The list of labels to use.
+        normalize : {'true', 'pred', 'all'}, optional
+            Normalization strategy.
+
+        Returns
+        -------
+        confusion_df : pd.DataFrame
+            Pooled confusion matrix with Model, TrueLabel, PredictedLabel,
+            and Value.
+
+        See Also
+        --------
+        ExperimentResult.get_confusion_matrices : Fold-level view.
+        """
+        return self._build_confusion_df(
+            model=model, labels=labels, normalize=normalize, group_cols=["Model"]
+        )
 
     def get_roc_curve(
         self, model: Optional[str] = None, pos_label: Optional[Any] = None
     ) -> pd.DataFrame:
-        """Get binary or one-vs-rest ROC curve coordinates."""
+        """
+        Get binary or one-vs-rest ROC curve coordinates.
+
+        Calculates False Positive Rate (FPR) and True Positive Rate (TPR) at
+        various thresholds for each fold. For multiclass problems, computes
+        One-vs-Rest (OvR) curves for each class.
+
+        Scientific Rationale
+        --------------------
+        Receiver Operating Characteristic (ROC) curves illustrate the
+        diagnostic ability of a classifier as its discrimination threshold is
+        varied. Analyzing the spread of these curves across folds helps in
+        assessing the robustness of the model's probabilistic rankings.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by.
+        pos_label : any, optional
+            The label to treat as the positive class in binary cases. If None,
+            uses the second class in alphabetical order.
+
+        Returns
+        -------
+        roc_df : pd.DataFrame
+            DataFrame with Model, Fold, Class, Threshold, FPR, and TPR.
+
+        See Also
+        --------
+        ExperimentResult.get_roc_auc_summary : Aggregate AUC metrics.
+        """
         from sklearn.metrics import roc_curve
 
-        rows = []
-        cols = ["Model", "Fold", "Class", "Threshold", "FPR", "TPR"]
-        for m_name, f_idx, label, y_binary, y_score in self._curve_score_groups(
-            model, pos_label=pos_label
+        frames = []
+        preds = scalar_prediction_frame(self.get_predictions(model=model))
+        for m_name, f_idx, label, y_binary, y_score in curve_score_groups(
+            preds, model=model, pos_label=pos_label
         ):
             fpr, tpr, thresholds = roc_curve(y_binary, y_score, pos_label=True)
-            for thresh, f_val, t_val in zip(thresholds, fpr, tpr):
-                rows.append(
-                    {
-                        "Model": m_name,
-                        "Fold": f_idx,
-                        "Class": label,
-                        "Threshold": thresh,
-                        "FPR": f_val,
-                        "TPR": t_val,
-                    }
-                )
-        return pd.DataFrame(rows, columns=cols)
+            df_c = pd.DataFrame(
+                {
+                    "Model": m_name,
+                    "Fold": f_idx,
+                    "Class": label,
+                    "Threshold": thresholds,
+                    "FPR": fpr,
+                    "TPR": tpr,
+                }
+            )
+            frames.append(df_c)
+
+        if not frames:
+            return pd.DataFrame(
+                columns=["Model", "Fold", "Class", "Threshold", "FPR", "TPR"]
+            )
+        return pd.concat(frames, ignore_index=True)
 
     def get_pr_curve(
         self, model: Optional[str] = None, pos_label: Optional[Any] = None
     ) -> pd.DataFrame:
-        """Get binary or one-vs-rest precision-recall curve coordinates."""
+        """
+        Get binary or one-vs-rest precision-recall curve coordinates.
+
+        Calculates Precision and Recall at various thresholds for each fold.
+        For multiclass problems, computes One-vs-Rest (OvR) curves for each class.
+
+        Scientific Rationale
+        --------------------
+        Precision-Recall (PR) curves are often more informative than ROC
+        curves for imbalanced datasets, as they focus on the model's
+        performance on the minority (positive) class.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by.
+        pos_label : any, optional
+            The label to treat as positive.
+
+        Returns
+        -------
+        pr_df : pd.DataFrame
+            DataFrame with Model, Fold, Class, Threshold, Precision, and Recall.
+
+        See Also
+        --------
+        ExperimentResult.get_pr_auc_summary : Average Precision summary.
+        """
         from sklearn.metrics import precision_recall_curve
 
-        rows = []
-        cols = ["Model", "Fold", "Class", "Threshold", "Precision", "Recall"]
-        for m_name, f_idx, label, y_binary, y_score in self._curve_score_groups(
-            model, pos_label=pos_label
+        frames = []
+        preds = scalar_prediction_frame(self.get_predictions(model=model))
+        for m_name, f_idx, label, y_binary, y_score in curve_score_groups(
+            preds, model=model, pos_label=pos_label
         ):
             precision, recall, thresholds = precision_recall_curve(
                 y_binary, y_score, pos_label=True
             )
-            threshold_values = np.append(thresholds, np.nan)
-            for thresh, p_val, r_val in zip(threshold_values, precision, recall):
-                rows.append(
-                    {
-                        "Model": m_name,
-                        "Fold": f_idx,
-                        "Class": label,
-                        "Threshold": thresh,
-                        "Precision": p_val,
-                        "Recall": r_val,
-                    }
-                )
-        return pd.DataFrame(rows, columns=cols)
+            # thresholds is 1 element shorter than precision/recall
+            thresh_vals = np.append(thresholds, np.nan)
+            df_c = pd.DataFrame(
+                {
+                    "Model": m_name,
+                    "Fold": f_idx,
+                    "Class": label,
+                    "Threshold": thresh_vals,
+                    "Precision": precision,
+                    "Recall": recall,
+                }
+            )
+            frames.append(df_c)
+
+        if not frames:
+            return pd.DataFrame(
+                columns=["Model", "Fold", "Class", "Threshold", "Precision", "Recall"]
+            )
+        return pd.concat(frames, ignore_index=True)
 
     def get_roc_auc_summary(self, model: Optional[str] = None) -> pd.DataFrame:
-        """Get summary ROC-AUC metrics across models and folds."""
+        """
+        Get summary ROC-AUC metrics across models and folds.
+
+        Calculates the Area Under the ROC Curve for each fold, using macro- and
+        weighted-averaging for multiclass tasks.
+
+        Parameters
+        ----------
+        model : str, optional
+            Model name to filter by.
+
+        Returns
+        -------
+        auc_df : pd.DataFrame
+            Summary with Model, Fold, MacroROCAUC, and WeightedROCAUC.
+
+        See Also
+        --------
+        ExperimentResult.get_roc_curve : Detailed curve coordinates.
+        """
         from sklearn.metrics import roc_auc_score
         from sklearn.preprocessing import LabelBinarizer
 
         rows = []
-        cols = ["Model", "Fold", "MacroROCAUC", "WeightedROCAUC"]
-        preds = self._standard_prediction_frame(model=model)
+        preds = scalar_prediction_frame(self.get_predictions(model=model))
         if preds.empty:
-            return pd.DataFrame(rows, columns=cols)
+            return pd.DataFrame(
+                columns=["Model", "Fold", "MacroROCAUC", "WeightedROCAUC"]
+            )
 
         proba_cols = sorted(
             [col for col in preds.columns if col.startswith("y_proba_")],
             key=lambda v: int(v.rsplit("_", 1)[-1]),
         )
         if not proba_cols:
-            return pd.DataFrame(rows, columns=cols)
+            return pd.DataFrame(
+                columns=["Model", "Fold", "MacroROCAUC", "WeightedROCAUC"]
+            )
 
         for (m_name, f_idx), group in preds.groupby(["Model", "Fold"]):
             y_true = group["y_true"].to_numpy()
@@ -433,8 +929,8 @@ class ExperimentResult:
             lb = LabelBinarizer()
             y_true_bin = lb.fit_transform(y_true)
             if y_true_bin.shape[1] == 1:
-                macro = roc_auc_score(y_true_bin, y_proba[:, -1])
-                weighted = macro
+                score = roc_auc_score(y_true_bin, y_proba[:, -1])
+                macro = weighted = score
             else:
                 macro = roc_auc_score(
                     y_true_bin, y_proba, multi_class="ovr", average="macro"
@@ -451,25 +947,46 @@ class ExperimentResult:
                     "WeightedROCAUC": float(weighted),
                 }
             )
-        return pd.DataFrame(rows, columns=cols)
+        return pd.DataFrame(rows)
 
     def get_pr_auc_summary(self, model: Optional[str] = None) -> pd.DataFrame:
-        """Get summary PR-AUC (Average Precision) metrics across models and folds."""
+        """
+        Get summary PR-AUC (Average Precision) metrics across models and folds.
+
+        Calculates the Area Under the Precision-Recall Curve for each fold.
+
+        Parameters
+        ----------
+        model : str, optional
+            Model name to filter by.
+
+        Returns
+        -------
+        auc_df : pd.DataFrame
+            Summary with Model, Fold, MacroPRAUC, and WeightedPRAUC.
+
+        See Also
+        --------
+        ExperimentResult.get_pr_curve : Detailed curve coordinates.
+        """
         from sklearn.metrics import average_precision_score
         from sklearn.preprocessing import LabelBinarizer
 
         rows = []
-        cols = ["Model", "Fold", "MacroPRAUC", "WeightedPRAUC"]
-        preds = self._standard_prediction_frame(model=model)
+        preds = scalar_prediction_frame(self.get_predictions(model=model))
         if preds.empty:
-            return pd.DataFrame(rows, columns=cols)
+            return pd.DataFrame(
+                columns=["Model", "Fold", "MacroPRAUC", "WeightedPRAUC"]
+            )
 
         proba_cols = sorted(
             [col for col in preds.columns if col.startswith("y_proba_")],
             key=lambda v: int(v.rsplit("_", 1)[-1]),
         )
         if not proba_cols:
-            return pd.DataFrame(rows, columns=cols)
+            return pd.DataFrame(
+                columns=["Model", "Fold", "MacroPRAUC", "WeightedPRAUC"]
+            )
 
         for (m_name, f_idx), group in preds.groupby(["Model", "Fold"]):
             y_true = group["y_true"].to_numpy()
@@ -478,8 +995,8 @@ class ExperimentResult:
             lb = LabelBinarizer()
             y_true_bin = lb.fit_transform(y_true)
             if y_true_bin.shape[1] == 1:
-                macro = average_precision_score(y_true_bin, y_proba[:, -1])
-                weighted = macro
+                score = average_precision_score(y_true_bin, y_proba[:, -1])
+                macro = weighted = score
             else:
                 macro = average_precision_score(y_true_bin, y_proba, average="macro")
                 weighted = average_precision_score(
@@ -494,7 +1011,7 @@ class ExperimentResult:
                     "WeightedPRAUC": float(weighted),
                 }
             )
-        return pd.DataFrame(rows, columns=cols)
+        return pd.DataFrame(rows)
 
     def get_calibration_curve(
         self,
@@ -503,216 +1020,328 @@ class ExperimentResult:
         pos_label: Optional[Any] = None,
         strategy: str = "uniform",
     ) -> pd.DataFrame:
-        """Get binary reliability/calibration curve coordinates."""
+        """
+        Get binary reliability/calibration curve coordinates.
+
+        Calculates the fraction of positive samples vs. mean predicted
+        probabilities for each probability bin.
+
+        Scientific Rationale
+        --------------------
+        A well-calibrated classifier provides probabilistic outputs that
+        reflect the true likelihood of the predicted event. Calibration
+        curves (reliability diagrams) are essential for assessing whether
+        predicted probabilities can be interpreted as confidence levels.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by.
+        n_bins : int, default=5
+            Number of bins to use for the calibration curve.
+        pos_label : any, optional
+            The label to treat as positive.
+        strategy : {'uniform', 'quantile'}, default='uniform'
+            Strategy used to define the widths of the bins.
+            - 'uniform': Bins have identical widths.
+            - 'quantile': Bins have the same number of samples.
+
+        Returns
+        -------
+        calibration_df : pd.DataFrame
+            DataFrame with Model, Fold, Class, MeanPredictedProbability,
+            and FractionPositive.
+
+        See Also
+        --------
+        ExperimentResult.get_probability_diagnostics : Brier score and Log Loss.
+        """
         from sklearn.calibration import calibration_curve
 
-        rows = []
-        cols = [
-            "Model",
-            "Fold",
-            "Class",
-            "MeanPredictedProbability",
-            "FractionPositive",
-        ]
-        for m_name, f_idx, label, y_binary, y_score in self._curve_score_groups(
-            model, require_probability=True, pos_label=pos_label
+        frames = []
+        preds = scalar_prediction_frame(self.get_predictions(model=model))
+        for m_name, f_idx, label, y_binary, y_score in curve_score_groups(
+            preds, model=model, require_probability=True, pos_label=pos_label
         ):
             p_true, p_pred = calibration_curve(
                 y_binary.astype(int), y_score, n_bins=n_bins, strategy=strategy
             )
-            for pr, tr in zip(p_pred, p_true):
-                rows.append(
-                    {
-                        "Model": m_name,
-                        "Fold": f_idx,
-                        "Class": label,
-                        "MeanPredictedProbability": pr,
-                        "FractionPositive": tr,
-                    }
-                )
-        return pd.DataFrame(rows, columns=cols)
+            df_c = pd.DataFrame(
+                {
+                    "Model": m_name,
+                    "Fold": f_idx,
+                    "Class": label,
+                    "MeanPredictedProbability": p_pred,
+                    "FractionPositive": p_true,
+                }
+            )
+            frames.append(df_c)
+
+        if not frames:
+            return pd.DataFrame(
+                columns=[
+                    "Model",
+                    "Fold",
+                    "Class",
+                    "MeanPredictedProbability",
+                    "FractionPositive",
+                ]
+            )
+        return pd.concat(frames, ignore_index=True)
 
     def get_probability_diagnostics(self, model: Optional[str] = None) -> pd.DataFrame:
-        """Get fold-level log-loss and Brier summaries when probabilities exist."""
-        from sklearn.metrics import brier_score_loss, log_loss
+        """
+        Get fold-level log-loss and Brier summaries when probabilities exist.
+
+        Computes summary metrics that penalize poor probability calibration
+        and high-uncertainty predictions.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by.
+
+        Returns
+        -------
+        diagnostics_df : pd.DataFrame
+            DataFrame in long format with Model, Fold, Metric, Class, and Value.
+            Metrics include 'log_loss', 'brier_score_ovr', and 'brier_score_macro'.
+
+        See Also
+        --------
+        ExperimentResult.get_calibration_curve : Visual calibration view.
+        """
+        from sklearn.metrics import log_loss
 
         rows = []
-        cols = ["Model", "Fold", "Metric", "Class", "Value"]
-        preds = self._standard_prediction_frame(model=model)
+        preds = scalar_prediction_frame(self.get_predictions(model=model))
         if preds.empty:
-            return pd.DataFrame(rows, columns=cols)
+            return pd.DataFrame(columns=["Model", "Fold", "Metric", "Class", "Value"])
+
         for (m_name, f_idx), group in preds.groupby(["Model", "Fold"]):
             y_true = group["y_true"].to_numpy()
-            labels = sorted(pd.unique(y_true).tolist())
-            y_proba = proba_matrix(group, len(labels))
+            unique_labels = sorted(pd.unique(y_true).tolist())
+            y_proba = proba_matrix(group, len(unique_labels))
             if y_proba is None:
                 continue
+
+            # 1. Log Loss (Overall)
             try:
+                ll = log_loss(y_true, y_proba, labels=unique_labels)
                 rows.append(
                     {
                         "Model": m_name,
                         "Fold": f_idx,
                         "Metric": "log_loss",
                         "Class": None,
-                        "Value": log_loss(y_true, y_proba, labels=labels),
+                        "Value": float(ll),
                     }
                 )
             except Exception as e:  # noqa: BLE001
-                logger.debug(
-                    f"log_loss scoring skipped for model={m_name} fold={f_idx}: {e}"
-                )
-            brier_values = []
-            for c_idx, label in enumerate(labels):
-                y_binary = np.asarray(y_true) == label
-                val = brier_score_loss(y_binary.astype(int), y_proba[:, c_idx])
-                brier_values.append(val)
+                logger.debug(f"log_loss skipped for {m_name} fold {f_idx}: {e}")
+
+            # 2. Brier Scores (Vectorized)
+            # Create binary matrix [n_samples, n_classes]
+            y_binary = (y_true[:, None] == np.array(unique_labels)).astype(float)
+            # Brier Score = Mean Squared Error per class
+            brier_ovr = np.mean((y_binary - y_proba) ** 2, axis=0)
+
+            for c_idx, label in enumerate(unique_labels):
                 rows.append(
                     {
                         "Model": m_name,
                         "Fold": f_idx,
                         "Metric": "brier_score_ovr",
                         "Class": label,
-                        "Value": val,
+                        "Value": float(brier_ovr[c_idx]),
                     }
                 )
-            if brier_values:
-                rows.append(
-                    {
-                        "Model": m_name,
-                        "Fold": f_idx,
-                        "Metric": "brier_score_macro",
-                        "Class": None,
-                        "Value": float(np.mean(brier_values)),
-                    }
-                )
-        return pd.DataFrame(rows, columns=cols)
+
+            # 3. Macro Brier Score
+            rows.append(
+                {
+                    "Model": m_name,
+                    "Fold": f_idx,
+                    "Metric": "brier_score_macro",
+                    "Class": None,
+                    "Value": float(np.mean(brier_ovr)),
+                }
+            )
+
+        return pd.DataFrame(rows)
 
     def get_statistical_assessment(
         self,
         lightweight: bool = False,
         metric: str = "accuracy",
+        unit: Optional[str] = None,
         n_permutations: int = 1000,
         random_state: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         Get finite-sample statistical assessment rows in long form.
 
+        Returns p-values and significance markers for model performance,
+        supporting both full-pipeline and post-hoc permutation methods.
+
+        Scientific Rationale
+        --------------------
+        Statistical significance in decoding ensures that observed performance
+        deltas are not due to chance fluctuations. This method allows
+        accessing pre-calculated results from the full experimental pipeline
+        (the gold standard) or running a faster post-hoc permutation test
+        directly on stored predictions.
+
         Parameters
         ----------
-        lightweight : bool
-            If True, perform a post-hoc label permutation on out-of-fold predictions.
-            This is fast but doesn't account for pipeline leakage.
-            If False (default), return the full-pipeline assessment if it was run.
-        metric : str
-            Metric to use for lightweight assessment.
-        n_permutations : int
-            Number of permutations for lightweight assessment.
-        random_state : int
-            Seed for lightweight permutations.
+        lightweight : bool, default=False
+            If True, perform a post-hoc label permutation on out-of-fold
+            predictions. Fast but does not account for pipeline leakage
+            (e.g., in tuning).
+            If False, returns results from the full-pipeline assessment if
+            they were computed during the experiment.
+        metric : str, default='accuracy'
+            Metric to use for the assessment.
+        unit : str, optional
+            The level of independence for the permutation test (e.g., 'subject').
+        n_permutations : int, default=1000
+            Number of permutations for the lightweight assessment.
+        random_state : int, optional
+            Seed for reproducible permutations.
+
+        Returns
+        -------
+        stats_df : pd.DataFrame
+            Tidy DataFrame with Model, Metric, Observed, PValue, and Significance.
+
+        See Also
+        --------
+        coco_pipe.decoding.stats.run_statistical_assessment : Underlying engine.
         """
+        u_type = self._resolve_inference_unit(unit)
+        rows = []
+
+        # 1. Pull pre-calculated results from the full pipeline if requested
+        if not lightweight:
+            for model, res in self.raw.items():
+                if "error" in res:
+                    continue
+                stats_rows = res.get("statistical_assessment", [])
+                for s in stats_rows:
+                    row = dict(s)
+                    row["Model"] = model
+                    rows.append(row)
+
+        # 2. Fallback to lightweight if no stats found
+        if not rows and not lightweight:
+            logger.info(
+                "Full-pipeline statistical assessment results not found. "
+                "Falling back to lightweight post-hoc assessment."
+            )
+            lightweight = True
+
+        # 3. Lightweight post-hoc permutation assessment
+        if lightweight:
+            from .stats import assess_post_hoc_permutation
+
+            for model, res in self.raw.items():
+                if "error" in res:
+                    continue
+                try:
+                    df_l = assess_post_hoc_permutation(
+                        res,
+                        metric=metric,
+                        unit=u_type,
+                        n_permutations=n_permutations,
+                        random_state=random_state,
+                    )
+                    df_l["Model"] = model
+                    rows.extend(df_l.to_dict("records"))
+                except Exception as e:
+                    logger.warning(f"Lightweight assessment failed for {model}: {e}")
+
+        if not rows:
+            return pd.DataFrame()
+
+        # Consistent column ordering
         cols = [
             "Model",
             "Metric",
             "Observed",
-            "InferentialUnit",
-            "NEff",
+            "PValue",
+            "Significant",
             "NullMethod",
             "NPermutations",
-            "P0",
-            "PValue",
-            "CILower",
-            "CIUpper",
-            "CorrectionMethod",
-            "CorrectedPValue",
-            "ChanceThreshold",
+            "InferentialUnit",
             "Time",
             "TrainTime",
             "TestTime",
             "NullLower",
             "NullUpper",
-            "Significant",
-            "Assumptions",
-            "Caveat",
         ]
+        df = pd.DataFrame(rows)
+        # Sort and filter columns to match what's present
+        present_cols = [c for c in cols if c in df.columns]
+        return df[present_cols]
 
-        if not lightweight:
-            rows = []
-            for res in self.raw.values():
-                if "error" in res:
-                    continue
-                rows.extend(res.get("statistical_assessment", []))
-            return pd.DataFrame(rows, columns=cols)
+    def get_statistical_nulls(self, model: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Return stored statistical null distributions, when configured.
 
-        # Lightweight post-hoc permutation
-        from .diagnostics import score_frame
+        Accesses the empirical null distributions (e.g., from permutation
+        tests) stored during the experiment.
 
-        rng = np.random.default_rng(random_state)
-        rows = []
-        preds = self._standard_prediction_frame()
-        if preds.empty:
-            return pd.DataFrame(rows, columns=cols)
+        Parameters
+        ----------
+        model : str, optional
+            Model name to filter by. Default is None (all models).
 
-        for m_name, group in preds.groupby("Model"):
-            y_t = group["y_true"].to_numpy()
-            obs = score_frame(group, metric)
+        Returns
+        -------
+        nulls : dict
+            Dictionary mapping model names to their null distribution payloads,
+            containing coordinates and permuted score arrays.
 
-            null = []
-            for _ in range(n_permutations):
-                # Shuffle labels but keep predictions fixed
-                perm_group = group.copy()
-                perm_group["y_true"] = rng.permutation(y_t)
-                null.append(score_frame(perm_group, metric))
-            null = np.array(null)
-
-            spec = get_metric_spec(metric)
-            if spec.greater_is_better:
-                p_val = (np.sum(null >= obs) + 1) / (n_permutations + 1)
-            else:
-                p_val = (np.sum(null <= obs) + 1) / (n_permutations + 1)
-
-            rows.append(
-                {
-                    "Model": m_name,
-                    "Metric": metric,
-                    "Observed": obs,
-                    "InferentialUnit": "sample",
-                    "NEff": len(y_t),
-                    "NullMethod": "posthoc_label_permutation",
-                    "NPermutations": n_permutations,
-                    "P0": None,
-                    "PValue": float(p_val),
-                    "CILower": float(np.quantile(null, 0.025)),
-                    "CIUpper": float(np.quantile(null, 0.975)),
-                    "CorrectionMethod": "none",
-                    "CorrectedPValue": float(p_val),
-                    "ChanceThreshold": None,
-                    "Time": None,
-                    "TrainTime": None,
-                    "TestTime": None,
-                    "NullLower": float(np.quantile(null, 0.025)),
-                    "NullUpper": float(np.quantile(null, 0.975)),
-                    "Significant": p_val <= 0.05,
-                    "Assumptions": "i.i.d. samples; post-hoc label shuffle",
-                    "Caveat": "Does not account for pipeline/tuning leakage.",
-                }
-            )
-        return pd.DataFrame(rows, columns=cols)
-
-    def get_statistical_nulls(self) -> Dict[str, Any]:
-        """Return stored statistical null distributions, when configured."""
+        See Also
+        --------
+        ExperimentResult.get_statistical_assessment : P-values derived from these nulls.
+        """
         nulls = {}
-        for model, res in self.raw.items():
+        for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
             if "error" in res:
                 continue
             if "statistical_nulls" in res:
-                nulls[model] = res["statistical_nulls"]
+                nulls[m_name] = res["statistical_nulls"]
         return nulls
 
-    def get_model_artifacts(self) -> pd.DataFrame:
-        """Return fold-level model artifact metadata in long form."""
+    def get_model_artifacts(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Return fold-level model artifact metadata in long form.
+
+        Accesses non-metric outputs stored by models, such as learned
+        coefficients, intercept values, or class labels.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by. Default is None (all models).
+
+        Returns
+        -------
+        artifacts_df : pd.DataFrame
+            DataFrame with Model, Fold, ArtifactType, Key, and Value.
+
+        See Also
+        --------
+        ExperimentResult.get_feature_importances : Specifically for importances.
+        """
         rows = []
         cols = ["Model", "Fold", "ArtifactType", "Key", "Value"]
-        for model, res in self.raw.items():
+        for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
             if "error" in res:
                 continue
             for f_idx, m in enumerate(res.get("metadata", [])):
@@ -722,7 +1351,7 @@ class ExperimentResult:
                         for k, v in payload.items():
                             rows.append(
                                 {
-                                    "Model": model,
+                                    "Model": m_name,
                                     "Fold": f_idx,
                                     "ArtifactType": a_type,
                                     "Key": k,
@@ -750,55 +1379,163 @@ class ExperimentResult:
         ci: float = 0.95,
         random_state: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Bootstrap metric confidence intervals over configured inference units."""
-        from .diagnostics import score_frame
+        """
+        Bootstrap metric confidence intervals over configured inference units.
+
+        Estimates the uncertainty of a performance metric by resampling
+        independent units (e.g., subjects) with replacement.
+
+        Scientific Rationale
+        --------------------
+        Bootstrapping provides a non-parametric estimate of the sampling
+        distribution of a metric. By resampling at the 'unit' level, we
+        account for within-unit correlations (e.g., multiple trials from the
+        same subject) and provide more realistic uncertainty bounds than
+        sample-level analytical methods.
+
+        Parameters
+        ----------
+        metric : str, default='accuracy'
+            The metric to estimate uncertainty for.
+        model : str, optional
+            The model name to filter by.
+        unit : str, optional
+            The level of independence for resampling (e.g., 'subject').
+        n_bootstraps : int, default=1000
+            Number of bootstrap iterations.
+        ci : float, default=0.95
+            Confidence interval level (e.g., 0.95 for 95% CI).
+        random_state : int, optional
+            Random seed for reproducibility.
+
+        Returns
+        -------
+        bootstrap_df : pd.DataFrame
+            DataFrame with Model, Metric, Estimate (observed), CILower, and CIUpper.
+
+        See Also
+        --------
+        coco_pipe.decoding.stats.assess_bootstrap_ci : Underlying engine.
+        """
+        from .stats import assess_bootstrap_ci
 
         u_type = self._resolve_inference_unit(unit)
-        rng = np.random.default_rng(random_state)
-        preds = self._standard_prediction_frame(model=model)
+        rows = []
+        for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
+            if "error" in res:
+                continue
+
+            try:
+                df_b = assess_bootstrap_ci(
+                    res,
+                    metric=metric,
+                    unit=u_type,
+                    n_bootstraps=n_bootstraps,
+                    ci=ci,
+                    random_state=random_state,
+                )
+                df_b["Model"] = m_name
+                rows.extend(df_b.to_dict("records"))
+            except Exception as e:
+                logger.warning(f"Bootstrap failed for {m_name}: {e}")
+
+        if not rows:
+            return pd.DataFrame()
+
         cols = [
             "Model",
             "Metric",
-            "Unit",
-            "NUnits",
             "Estimate",
             "CILower",
             "CIUpper",
+            "Unit",
+            "NUnits",
             "NBootstraps",
         ]
-        rows = []
-        if preds.empty:
-            return pd.DataFrame(rows, columns=cols)
-        alpha = (1.0 - ci) / 2.0
-        for m_name, group in preds.groupby("Model"):
-            u_indices = unit_indices(group, u_type)
-            est = score_frame(group, metric)
-            boot = []
-            for _ in range(n_bootstraps):
-                sampled = rng.integers(0, len(u_indices), size=len(u_indices))
-                indices = np.concatenate([u_indices[idx] for idx in sampled])
-                sample = group.iloc[indices]
-                try:
-                    boot.append(score_frame(sample, metric))
-                except Exception:
-                    # Metrics like ROC-AUC may fail if only one class is present
-                    # in a bootstrap sample
-                    boot.append(np.nan)
+        return pd.DataFrame(rows)[cols]
 
-            boot = np.array(boot)
-            rows.append(
-                {
-                    "Model": m_name,
-                    "Metric": metric,
-                    "Unit": u_type,
-                    "NUnits": len(u_indices),
-                    "Estimate": est,
-                    "CILower": float(np.nanquantile(boot, alpha)),
-                    "CIUpper": float(np.nanquantile(boot, 1.0 - alpha)),
-                    "NBootstraps": n_bootstraps,
-                }
-            )
-        return pd.DataFrame(rows, columns=cols)
+    def compare_models(
+        self,
+        models: Optional[Sequence[str]] = None,
+        metric: str = "accuracy",
+        unit: Optional[str] = None,
+        n_permutations: int = 1000,
+        correction: str = "fdr_bh",
+        random_state: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Perform exhaustive pairwise comparisons between multiple models.
+
+        Automatically applies p-value correction (e.g., FDR) for the multiple
+        comparisons performed across all pairs of models.
+
+        Scientific Rationale
+        --------------------
+        Benchmarking multiple models requires controlling for the 'multiple
+        comparisons problem'—the increased risk of Type I errors (false
+        positives) when testing many hypotheses. This method automates the
+        pairwise testing and subsequent error-rate control.
+
+        Parameters
+        ----------
+        models : list of str, optional
+            List of model names to compare. Default is all models in the result.
+        metric : str, default='accuracy'
+            Metric to use for comparison.
+        unit : str, optional
+            Level of independence for permutation testing (e.g., 'subject').
+        n_permutations : int, default=1000
+            Number of permutations for each paired test.
+        correction : str, default='fdr_bh'
+            Multiple comparison correction method (e.g., 'bonferroni', 'fdr_bh').
+        random_state : int, optional
+            Random seed for permutations.
+
+        Returns
+        -------
+        comparison_df : pd.DataFrame
+            DataFrame containing ModelA, ModelB, Difference, and corrected
+            PValue (PValueCorrected).
+
+        See Also
+        --------
+        ExperimentResult.compare_models_paired : Underlying paired test.
+        """
+        from itertools import combinations
+
+        if models is None:
+            models = sorted(self.raw.keys())
+
+        if len(models) < 2:
+            raise ValueError("Need at least two models to perform a comparison.")
+
+        all_results = []
+        # 1. Run all pairwise comparisons
+        for m_a, m_b in combinations(models, 2):
+            try:
+                res = self.compare_models_paired(
+                    model_a=m_a,
+                    model_b=m_b,
+                    metric=metric,
+                    unit=unit,
+                    n_permutations=n_permutations,
+                    random_state=random_state,
+                )
+                all_results.append(res)
+            except Exception as e:
+                logger.warning(f"Comparison failed for {m_a} vs {m_b}: {e}")
+
+        if not all_results:
+            return pd.DataFrame()
+
+        df = pd.concat(all_results, ignore_index=True)
+
+        # 2. Apply multiple comparison correction
+        from .stats import apply_multiple_comparison_correction
+
+        return apply_multiple_comparison_correction(df, method=correction)
 
     def compare_models_paired(
         self,
@@ -809,22 +1546,74 @@ class ExperimentResult:
         n_permutations: int = 1000,
         random_state: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Paired model comparison using outer-fold predictions on shared samples."""
-        from .diagnostics import score_frame
+        """
+        Paired model comparison using outer-fold predictions on shared samples.
+
+        Performs a within-unit permutation test (e.g., swapping model labels
+        per subject) to determine if the performance difference is significant.
+
+        Scientific Rationale
+        --------------------
+        Paired tests are generally more powerful than independent-sample tests
+        because they control for unit-specific baseline variance (e.g., a subject
+        who is overall 'harder' to decode). By aligning predictions at the
+        sample level across models, we ensure a valid paired comparison.
+
+        Parameters
+        ----------
+        model_a, model_b : str
+            The names of the two models to compare.
+        metric : str, default='accuracy'
+            Metric to use for comparison.
+        unit : str, optional
+            Level of independence (e.g., 'subject').
+        n_permutations : int, default=1000
+            Number of permutations for the test.
+        random_state : int, optional
+            Random seed for reproducible permutations.
+
+        Returns
+        -------
+        paired_df : pd.DataFrame
+            DataFrame with ModelA, ModelB, ScoreA, ScoreB, Difference, and PValue.
+
+        See Also
+        --------
+        coco_pipe.decoding.stats.assess_paired_comparison : Underlying engine.
+        """
+        from .stats import assess_paired_comparison
 
         u_type = self._resolve_inference_unit(unit)
-        preds = self._standard_prediction_frame()
-        a, b = preds[preds["Model"] == model_a], preds[preds["Model"] == model_b]
+        preds = scalar_prediction_frame(self.get_predictions())
+        a = preds[preds["Model"] == model_a]
+        b = preds[preds["Model"] == model_b]
 
-        # Merge to find shared samples
-        # We need to preserve all necessary columns for scoring
-        # (y_true, y_pred, y_proba_*, y_score)
+        if a.empty or b.empty:
+            raise ValueError(f"One or both models not found: {model_a}, {model_b}")
+
+        # Merge to find shared samples across all relevant coordinates
         merge_cols = ["SampleID", "y_true", "Fold"]
         for col in ["Time", "TrainTime", "TestTime"]:
             if col in a and col in b:
                 merge_cols.append(col)
 
         merged = a.merge(b, on=merge_cols, suffixes=("_A", "_B"))
+        if merged.empty:
+            raise ValueError("No overlapping samples found between the two models.")
+
+        df_res = assess_paired_comparison(
+            merged,
+            metric=metric,
+            unit=u_type,
+            n_permutations=n_permutations,
+            random_state=random_state,
+        )
+
+        df_res["ModelA"] = model_a
+        df_res["ModelB"] = model_b
+        df_res["Unit"] = u_type
+
+        # Reorder columns
         cols = [
             "ModelA",
             "ModelB",
@@ -835,228 +1624,168 @@ class ExperimentResult:
             "ScoreB",
             "Difference",
             "PValue",
-            "NPermutations",
+            "Significant",
         ]
-        if merged.empty:
-            return pd.DataFrame([], columns=cols)
+        # Preserve temporal columns if present
+        for c in ["Time", "TrainTime", "TestTime"]:
+            if c in df_res.columns:
+                cols.insert(4, c)
 
-        s_a = score_frame(
-            merged.rename(columns=lambda x: x[:-2] if x.endswith("_A") else x), metric
-        )
-        s_b = score_frame(
-            merged.rename(columns=lambda x: x[:-2] if x.endswith("_B") else x), metric
-        )
-        obs = s_a - s_b
+        return df_res[cols]
 
-        rng = np.random.default_rng(random_state)
-        u_indices = paired_unit_indices(merged, u_type)
-        null = []
+    def get_feature_importances(
+        self, model: Optional[str] = None, fold_level: bool = False
+    ) -> pd.DataFrame:
+        """
+        Get feature importances in long format.
 
-        # Extract prediction/proba columns to swap
-        pred_cols_a = [c for c in merged.columns if c.endswith("_A") and c != "Group_A"]
-        pred_cols_b = [c.replace("_A", "_B") for c in pred_cols_a]
+        Aggregates relative feature contributions (e.g., coefficients,
+        Gini importance) across all folds.
 
-        for _ in range(n_permutations):
-            perm_merged = merged.copy()
-            swaps = rng.random(len(u_indices)) < 0.5
-            for swap, idxs in zip(swaps, u_indices):
-                if swap:
-                    # Swap all prediction-related columns for these units
-                    for ca, cb in zip(pred_cols_a, pred_cols_b):
-                        tmp = perm_merged.loc[merged.index[idxs], ca].copy()
-                        perm_merged.loc[merged.index[idxs], ca] = perm_merged.loc[
-                            merged.index[idxs], cb
-                        ].values
-                        perm_merged.loc[merged.index[idxs], cb] = tmp.values
+        Scientific Rationale
+        --------------------
+        Feature importances identify the data dimensions that drive the model's
+        predictions. Analyzing these across folds ensures that identified
+        features are robust and not artifacts of a specific data split. Ranking
+        features provides a prioritized list for subsequent biological
+        interpretation.
 
-            p_s_a = score_frame(
-                perm_merged.rename(columns=lambda x: x[:-2] if x.endswith("_A") else x),
-                metric,
-            )
-            p_s_b = score_frame(
-                perm_merged.rename(columns=lambda x: x[:-2] if x.endswith("_B") else x),
-                metric,
-            )
-            null.append(p_s_a - p_s_b)
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by. Default is None (all models).
+        fold_level : bool, default=False
+            - If True: Returns importance for each fold individually.
+            - If False: Returns the mean and standard deviation across folds.
 
-        p_val = (np.sum(np.abs(null) >= abs(obs)) + 1) / (n_permutations + 1)
-        return pd.DataFrame(
-            [
-                {
-                    "ModelA": model_a,
-                    "ModelB": model_b,
-                    "Metric": metric,
-                    "Unit": u_type,
-                    "NUnits": len(u_indices),
-                    "ScoreA": s_a,
-                    "ScoreB": s_b,
-                    "Difference": obs,
-                    "PValue": float(p_val),
-                    "NPermutations": n_permutations,
-                }
-            ],
-            columns=cols,
-        )
+        Returns
+        -------
+        importances_df : pd.DataFrame
+            DataFrame with Model, FeatureName, and Importance (or Mean/Std).
+            Includes a 'Rank' column based on the importance magnitude.
 
-    def _standard_prediction_frame(self, model: Optional[str] = None) -> pd.DataFrame:
-        """Return scalar prediction rows, excluding temporal-expanded rows."""
-        preds = self.get_predictions()
-        if preds.empty:
-            return preds
-        if model is not None:
-            preds = preds[preds["Model"] == model]
-        for col in ["Time", "TrainTime", "TestTime"]:
-            if col in preds:
-                preds = preds[preds[col].isna()]
-        return preds
+        See Also
+        --------
+        ExperimentResult.get_selected_features : If feature selection was used.
+        """
 
-    def _curve_score_groups(
-        self,
-        model: Optional[str] = None,
-        require_probability: bool = False,
-        pos_label: Optional[Any] = None,
-    ):
-        """Yield binary or one-vs-rest score arrays for curve accessors."""
-        preds = self._standard_prediction_frame(model=model)
-        if preds.empty:
-            return
-        for (m_name, f_idx), group in preds.groupby(["Model", "Fold"]):
-            y_t = group["y_true"].to_numpy()
-            labels = sorted(pd.unique(y_t).tolist())
-            if len(labels) < 2:
+        frames = []
+        for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
                 continue
-            if len(labels) == 2:
-                label = resolve_pos_label(y_t, pos_label)
-                l_idx = labels.index(label)
-                p_col = f"y_proba_{l_idx}"
-                if p_col in group and group[p_col].notna().all():
-                    y_s = group[p_col].to_numpy(dtype=float)
-                elif (
-                    not require_probability
-                    and "y_score" in group
-                    and group["y_score"].notna().all()
-                ):
-                    y_s = group["y_score"].to_numpy(dtype=float)
-                    if l_idx == 0:
-                        y_s = -y_s
-                else:
-                    continue
-                yield m_name, f_idx, label, np.asarray(y_t) == label, y_s
-                continue
-            for c_idx, label in enumerate(labels):
-                p_col, s_col = f"y_proba_{c_idx}", f"y_score_{c_idx}"
-                if p_col in group and group[p_col].notna().all():
-                    y_s = group[p_col].to_numpy(dtype=float)
-                elif (
-                    not require_probability
-                    and s_col in group
-                    and group[s_col].notna().all()
-                ):
-                    y_s = group[s_col].to_numpy(dtype=float)
-                else:
-                    continue
-                yield m_name, f_idx, label, np.asarray(y_t) == label, y_s
-
-    def get_feature_importances(self, fold_level: bool = False) -> pd.DataFrame:
-        """Get feature importances in long format."""
-        cols = (
-            ["Model", "Fold", "Feature", "FeatureName", "Importance", "Rank"]
-            if fold_level
-            else ["Model", "Feature", "FeatureName", "Mean", "Std", "Rank"]
-        )
-        rows = []
-        for model, res in self.raw.items():
             if "error" in res:
                 continue
+
             imp = res.get("importances")
             if not imp:
                 continue
+
             if fold_level:
                 raw = np.asarray(imp.get("raw", []), dtype=float)
                 if raw.ndim != 2:
                     continue
-                f_names = feature_names_for_result(res, raw.shape[1])
-                for f_idx, f_vals in enumerate(raw):
-                    for ft_idx, val in enumerate(f_vals):
-                        rows.append(
-                            {
-                                "Model": model,
-                                "Fold": f_idx,
-                                "Feature": ft_idx,
-                                "FeatureName": f_names[ft_idx],
-                                "Importance": val,
-                            }
-                        )
-            else:
-                means, stds = (
-                    np.asarray(imp.get("mean", []), dtype=float).ravel(),
-                    np.asarray(imp.get("std", []), dtype=float).ravel(),
+                n_feats = raw.shape[1]
+                f_names = imp.get("feature_names")
+                if f_names is None or len(f_names) != n_feats:
+                    f_names = [f"feature_{i}" for i in range(n_feats)]
+
+                df_m = pd.DataFrame(raw, columns=f_names)
+                df_m.index.name = "Fold"
+                df_m = df_m.reset_index().melt(
+                    id_vars="Fold", var_name="FeatureName", value_name="Importance"
                 )
+                df_m["Model"] = m_name
+                # Reconstruct Feature Index
+                name_to_idx = {name: i for i, name in enumerate(f_names)}
+                df_m["Feature"] = df_m["FeatureName"].map(name_to_idx)
+                frames.append(df_m)
+            else:
+                means = np.asarray(imp.get("mean", []), dtype=float).ravel()
                 if len(means) == 0:
                     continue
-                f_names = feature_names_for_result(res, len(means))
+                stds = np.asarray(imp.get("std", []), dtype=float).ravel()
                 if len(stds) != len(means):
                     stds = np.full(len(means), np.nan)
-                for ft_idx, m in enumerate(means):
-                    rows.append(
-                        {
-                            "Model": model,
-                            "Feature": ft_idx,
-                            "FeatureName": f_names[ft_idx],
-                            "Mean": m,
-                            "Std": stds[ft_idx],
-                        }
-                    )
-        df = pd.DataFrame(rows, columns=cols)
-        if df.empty:
-            return df
+
+                f_names = imp.get("feature_names")
+                if f_names is None or len(f_names) != len(means):
+                    f_names = [f"feature_{i}" for i in range(len(means))]
+                df_m = pd.DataFrame(
+                    {
+                        "Model": m_name,
+                        "Feature": np.arange(len(means)),
+                        "FeatureName": f_names,
+                        "Mean": means,
+                        "Std": stds,
+                    }
+                )
+                frames.append(df_m)
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
+
+        # Add ranks
+        group_cols = ["Model"]
         if fold_level:
-            df["Rank"] = (
-                df.groupby(["Model", "Fold"])["Importance"]
-                .rank(ascending=False, method="min")
-                .astype(int)
-            )
+            group_cols.append("Fold")
+            val_col = "Importance"
         else:
-            df["Rank"] = (
-                df.groupby("Model")["Mean"]
-                .rank(ascending=False, method="min")
-                .astype(int)
-            )
-        return df
+            val_col = "Mean"
 
-    def _metadata_columns_from_splits(self) -> list[str]:
-        from .diagnostics import metadata_display_name
+        df["Rank"] = df.groupby(group_cols)[val_col].rank(ascending=False, method="min")
 
-        cols = []
-        for res in self.raw.values():
-            if "error" in res:
-                continue
-            for split in res.get("splits", []):
-                for m_key in ("train_metadata", "test_metadata"):
-                    for key in (split.get(m_key) or {}).keys():
-                        col = metadata_display_name(key)
-                        if col not in cols:
-                            cols.append(col)
-        return cols
+        # Ensure stable column order for API consistency
+        if fold_level:
+            ordered_cols = [
+                "Model",
+                "Fold",
+                "Feature",
+                "FeatureName",
+                "Importance",
+                "Rank",
+            ]
+        else:
+            ordered_cols = ["Model", "Feature", "FeatureName", "Mean", "Std", "Rank"]
+
+        return df[ordered_cols]
 
     def _resolve_inference_unit(self, unit: Optional[str]) -> str:
         if unit is not None:
             return unit
         return self.meta.get("inferential_unit") or "sample"
 
-    def _time_axis(self) -> Optional[list[Any]]:
-        t_axis = self.meta.get("time_axis")
-        return list(t_axis) if t_axis is not None else None
-
     def _time_value(self, index: int) -> Any:
-        from .diagnostics import time_value as get_time_val
+        from ._diagnostics import time_value as get_time_val
 
-        return get_time_val(index, self._time_axis())
+        return get_time_val(index, self.time_axis)
 
-    def get_best_params(self) -> pd.DataFrame:
-        """Get the best hyperparameters selected per fold."""
+    def get_best_params(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get the best hyperparameters selected per fold.
+
+        If hyperparameter tuning was enabled, returns the optimal
+        configuration found in each cross-validation outer fold.
+
+        Parameters
+        ----------
+        model : str, optional
+            The name of the model to filter by. Default is None (all models).
+
+        Returns
+        -------
+        params_df : pd.DataFrame
+            DataFrame with Model, Fold, Param, and Value.
+
+        See Also
+        --------
+        ExperimentResult.get_search_results : Detailed tuning diagnostics.
+        """
         rows = []
         for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
             if "error" in res:
                 continue
             if "metadata" in res:
@@ -1073,19 +1802,32 @@ class ExperimentResult:
                             )
         return pd.DataFrame(rows)
 
-    def get_search_results(self) -> pd.DataFrame:
-        """Get compact hyperparameter-search diagnostics in long form."""
+    def get_search_results(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get compact hyperparameter-search diagnostics in long form.
+
+        Provides a summary of all candidate configurations evaluated during
+        tuning, including their mean performance and ranking.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by. Default is None (all models).
+
+        Returns
+        -------
+        search_df : pd.DataFrame
+            DataFrame with Model, Fold, Candidate, Rank, MeanTestScore,
+            StdTestScore, and Params.
+
+        See Also
+        --------
+        ExperimentResult.get_best_params : Just the winner per fold.
+        """
         rows = []
-        cols = [
-            "Model",
-            "Fold",
-            "Candidate",
-            "Rank",
-            "MeanTestScore",
-            "StdTestScore",
-            "Params",
-        ]
         for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
             if "error" in res:
                 continue
             for f_idx, meta in enumerate(res.get("metadata", [])):
@@ -1101,100 +1843,184 @@ class ExperimentResult:
                             "Params": s_row.get("params"),
                         }
                     )
+        cols = [
+            "Model",
+            "Fold",
+            "Candidate",
+            "Rank",
+            "MeanTestScore",
+            "StdTestScore",
+            "Params",
+        ]
         return pd.DataFrame(rows, columns=cols)
 
-    def get_selected_features(self) -> pd.DataFrame:
-        """Get fold-level selected feature masks in long format."""
-        rows = []
-        cols = ["Model", "Fold", "Feature", "FeatureName", "Selected", "Order"]
+    def get_selected_features(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get fold-level selected feature masks in long format.
+
+        Returns a boolean mask indicating which features were retained by
+        automated feature selection in each fold.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by. Default is None (all models).
+
+        Returns
+        -------
+        features_df : pd.DataFrame
+            DataFrame with Model, Fold, FeatureName, and Selected status.
+            Includes an 'Order' column if recursive or sequential selection
+            was used.
+
+        See Also
+        --------
+        ExperimentResult.get_feature_stability : Cross-fold selection consistency.
+        """
+        frames = []
         for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
             if "error" in res:
                 continue
             for f_idx, meta in enumerate(res.get("metadata", [])):
                 if "selected_features" not in meta:
                     continue
+
                 mask = np.asarray(meta["selected_features"], dtype=bool)
                 order = meta.get("selection_order")
                 f_names = meta.get("feature_names")
                 if f_names is None or len(f_names) != len(mask):
                     f_names = [f"feature_{idx}" for idx in range(len(mask))]
 
-                for ft_idx, selected in enumerate(mask):
-                    s_order = None
-                    if order is not None:
-                        # If order is a ranking array (like RFE.ranking_)
-                        if isinstance(order, (np.ndarray, list)) and len(order) == len(
-                            mask
-                        ):
-                            s_order = int(order[ft_idx])
-                        # If order is a list of selected indices in order
-                        elif isinstance(order, (list, np.ndarray)) and ft_idx in order:
-                            s_order = list(order).index(ft_idx) + 1
+                df_f = pd.DataFrame(
+                    {
+                        "Model": m_name,
+                        "Fold": f_idx,
+                        "Feature": np.arange(len(mask)),
+                        "FeatureName": f_names,
+                        "Selected": mask,
+                    }
+                )
 
-                    rows.append(
-                        {
-                            "Model": m_name,
-                            "Fold": f_idx,
-                            "Feature": ft_idx,
-                            "FeatureName": f_names[ft_idx],
-                            "Selected": bool(selected),
-                            "Order": s_order,
-                        }
-                    )
-        return pd.DataFrame(rows, columns=cols)
+                if order is not None:
+                    # Resolve order (Rank)
+                    order_arr = np.asarray(order)
+                    if len(order_arr) == len(mask):
+                        df_f["Order"] = order_arr
+                    elif len(order_arr) < len(mask):
+                        # Order is a list of selected indices
+                        order_map = {idx: i + 1 for i, idx in enumerate(order_arr)}
+                        df_f["Order"] = df_f["Feature"].map(order_map)
+                else:
+                    df_f["Order"] = np.nan
 
-    def get_feature_scores(self) -> pd.DataFrame:
-        """Get fold-level feature-selection scores."""
-        rows = []
-        cols = [
-            "Model",
-            "Fold",
-            "Feature",
-            "FeatureName",
-            "Selector",
-            "Score",
-            "PValue",
-            "Selected",
-        ]
+                frames.append(df_f)
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def get_feature_scores(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get fold-level feature-selection scores.
+
+        Accesses raw univariate or multivariate scores (e.g., F-values,
+        p-values, or internal selector scores) used for feature ranking.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by. Default is None (all models).
+
+        Returns
+        -------
+        scores_df : pd.DataFrame
+            DataFrame with Model, Fold, FeatureName, Score, and PValue
+            (if available).
+
+        See Also
+        --------
+        ExperimentResult.get_selected_features : Final binary selection mask.
+        """
+        frames = []
         for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
             if "error" in res:
                 continue
             for f_idx, meta in enumerate(res.get("metadata", [])):
                 if "feature_scores" not in meta:
                     continue
+
                 scores = np.asarray(meta["feature_scores"], dtype=float)
                 pvals = meta.get("feature_pvalues")
-                if pvals is not None:
-                    pvals = np.asarray(pvals, dtype=float)
                 f_names = meta.get("feature_names")
                 if f_names is None or len(f_names) != len(scores):
                     f_names = [f"feature_{idx}" for idx in range(len(scores))]
-                sel = meta.get("selected_features")
-                if sel is not None:
-                    sel = np.asarray(sel, dtype=bool)
-                for ft_idx, sc in enumerate(scores):
-                    rows.append(
-                        {
-                            "Model": m_name,
-                            "Fold": f_idx,
-                            "Feature": ft_idx,
-                            "FeatureName": f_names[ft_idx],
-                            "Selector": meta.get("feature_selection_method"),
-                            "Score": sc,
-                            "PValue": pvals[ft_idx]
-                            if pvals is not None and len(pvals) == len(scores)
-                            else np.nan,
-                            "Selected": bool(sel[ft_idx])
-                            if sel is not None and len(sel) == len(scores)
-                            else np.nan,
-                        }
-                    )
-        return pd.DataFrame(rows, columns=cols)
 
-    def get_feature_stability(self) -> pd.DataFrame:
-        """Analyze feature selection stability across folds."""
-        rows = []
+                sel = meta.get("selected_features")
+
+                df_f = pd.DataFrame(
+                    {
+                        "Model": m_name,
+                        "Fold": f_idx,
+                        "Feature": np.arange(len(scores)),
+                        "FeatureName": f_names,
+                        "Selector": meta.get("feature_selection_method"),
+                        "Score": scores,
+                    }
+                )
+
+                if pvals is not None and len(pvals) == len(scores):
+                    df_f["PValue"] = np.asarray(pvals, dtype=float)
+                else:
+                    df_f["PValue"] = np.nan
+
+                if sel is not None and len(sel) == len(scores):
+                    df_f["Selected"] = np.asarray(sel, dtype=bool)
+                else:
+                    df_f["Selected"] = np.nan
+
+                frames.append(df_f)
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def get_feature_stability(self, model: Optional[str] = None) -> pd.DataFrame:
+        """
+        Analyze feature selection stability across folds.
+
+        Calculates the frequency with which each feature was selected across
+        the cross-validation procedure.
+
+        Scientific Rationale
+        --------------------
+        Stability analysis helps distinguish robust predictors from features
+        that are selected due to noise in specific data splits. High stability
+        (e.g., > 90% of folds) provides strong evidence for the relevance of
+        a feature to the decoding task.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by. Default is None (all models).
+
+        Returns
+        -------
+        stability_df : pd.DataFrame
+            DataFrame with Model, FeatureName, SelectionFrequency (0.0 to 1.0),
+            and NFolds.
+
+        See Also
+        --------
+        ExperimentResult.get_selected_features : Fold-level selection data.
+        """
+        frames = []
         for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
             if "error" in res:
                 continue
             if "metadata" in res:
@@ -1205,37 +2031,129 @@ class ExperimentResult:
                         masks.append(meta["selected_features"])
                         if f_names is None and "feature_names" in meta:
                             f_names = meta["feature_names"]
-                if masks:
-                    stack = np.vstack(masks)
-                    stability = np.mean(stack, axis=0)
-                    for ft_idx, freq in enumerate(stability):
-                        row = {"Model": m_name, "Feature": ft_idx, "Frequency": freq}
-                        if f_names is not None and len(f_names) == len(stability):
-                            row["FeatureName"] = f_names[ft_idx]
-                        rows.append(row)
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    def get_generalization_matrix(self, metric: str = None) -> pd.DataFrame:
-        """Get Generalization Matrix (Train Time x Test Time) averaged across folds."""
-        for model_name, res in self.raw.items():
+                if not masks:
+                    continue
+
+                stack = np.vstack(masks)  # [n_folds, n_features]
+                n_folds = stack.shape[0]
+                freq = np.mean(stack, axis=0)
+
+                if f_names is None or len(f_names) != stack.shape[1]:
+                    f_names = [f"feature_{i}" for i in range(stack.shape[1])]
+
+                df_m = pd.DataFrame(
+                    {
+                        "Model": m_name,
+                        "Feature": np.arange(len(freq)),
+                        "FeatureName": f_names,
+                        "SelectionFrequency": freq,
+                        "NFolds": n_folds,
+                    }
+                )
+                frames.append(df_m)
+
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    def get_generalization_matrix(
+        self, model: Optional[str] = None, metric: str = "accuracy"
+    ) -> pd.DataFrame:
+        """
+        Get Generalization Matrix (Train Time x Test Time) averaged across folds.
+
+        Computes the cross-temporal performance matrix for Time-Generalization
+        analysis.
+
+        Scientific Rationale
+        --------------------
+        Temporal Generalization (TG) analysis reveals the dynamics of neural
+        representations. By training a classifier at one time point and
+        testing it across all others, we can identify whether a neural
+        pattern is transient, sustained, or reoccurring.
+
+        Parameters
+        ----------
+        model : str, optional
+            The model name to filter by. Default is None (all models).
+            If None, returns a long-format DataFrame suitable for plotting.
+        metric : str, default='accuracy'
+            The metric to retrieve.
+
+        Returns
+        -------
+        gen_df : pd.DataFrame
+            - If model is specified: A square matrix (2D DataFrame) with
+              TrainTime as index and TestTime as columns.
+            - If model is None: A tidy long-format DataFrame with Model,
+              Metric, TrainTime, TestTime, and Value.
+
+        See Also
+        --------
+        ExperimentResult.get_temporal_score_summary : Linear temporal summary.
+        """
+        frames = []
+        for m_name, res in self.raw.items():
+            if model is not None and m_name != model:
+                continue
             if "error" in res:
                 continue
-            metrics_data = res["metrics"]
-            if metric is None:
-                metric = list(metrics_data.keys())[0]
+
+            metrics_data = res.get("metrics", {})
             if metric not in metrics_data:
-                continue
-            fold_scores = metrics_data[metric]["folds"]
+                # Fallback to first available metric if requested one is missing
+                if not metrics_data:
+                    continue
+                metric = next(iter(metrics_data.keys()))
+
+            fold_scores = metrics_data[metric].get("folds", [])
             valid_matrices = [
                 s for s in fold_scores if isinstance(s, np.ndarray) and s.ndim == 2
             ]
+
             if valid_matrices:
                 stack = np.stack(valid_matrices)
                 mean = np.nanmean(stack, axis=0)
-                time_axis = self._time_axis()
-                if time_axis is not None and len(time_axis) == mean.shape[0]:
-                    labels = time_axis
-                else:
+
+                labels = self.time_axis
+                if labels is None or len(labels) != mean.shape[0]:
                     labels = list(range(mean.shape[0]))
-                return pd.DataFrame(mean, index=labels, columns=labels)
-        return pd.DataFrame()
+
+                df_gen = pd.DataFrame(mean, index=labels, columns=labels)
+                df_gen.index.name = "TrainTime"
+                df_gen.columns.name = "TestTime"
+
+                if model is not None:
+                    return df_gen
+
+                df_gen = df_gen.stack().reset_index(name="Value")
+                df_gen["Model"] = m_name
+                df_gen["Metric"] = metric
+                frames.append(df_gen)
+
+        if not frames:
+            return pd.DataFrame()
+
+        return pd.concat(frames, ignore_index=True)
+
+
+def make_serializable(obj: Any) -> Any:
+    """Recursively convert NumPy types to JSON-safe Python primitives."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.int64, np.int32, np.int16, np.integer)):
+        return int(obj)
+    if isinstance(obj, (np.float64, np.float32, np.floating)):
+        return float(obj)
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, dict):
+        return {str(k): make_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [make_serializable(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    return obj

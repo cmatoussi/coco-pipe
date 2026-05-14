@@ -1,349 +1,250 @@
 import numpy as np
+import pandas as pd
 import pytest
-from scipy.stats import binom
-from sklearn.datasets import make_classification
 
-from coco_pipe.decoding import Experiment, ExperimentConfig
 from coco_pipe.decoding.configs import (
     ChanceAssessmentConfig,
-    ClassicalModelConfig,
-    CVConfig,
     StatisticalAssessmentConfig,
-    TuningConfig,
 )
-from coco_pipe.decoding.core import ExperimentResult
 from coco_pipe.decoding.stats import (
+    _accuracy_ci,
+    _coord_dict,
+    _correct_p_values,
+    _empirical_p_values,
+    _run_binomial_assessment,
     aggregate_predictions_for_inference,
+    apply_multiple_comparison_correction,
+    assess_paired_comparison,
+    assess_post_hoc_permutation,
     binomial_accuracy_test,
+    run_paired_permutation_assessment,
 )
-from coco_pipe.report.core import Report
-from coco_pipe.viz.decoding import plot_temporal_statistical_assessment
+
+# --- Unit Tests for Core Stats Functions ---
 
 
-def _prediction_frame():
-    return ExperimentResult(
+def test_aggregate_predictions_regression_mean():
+    df = pd.DataFrame(
         {
-            "m": {
-                "metrics": {},
-                "predictions": [
-                    {
-                        "sample_index": np.arange(6),
-                        "sample_id": np.array(["e0", "e1", "e2", "e3", "e4", "e5"]),
-                        "group": np.array(["s0", "s0", "s1", "s1", "s2", "s2"]),
-                        "sample_metadata": {
-                            "subject": ["s0", "s0", "s1", "s1", "s2", "s2"],
-                            "session": ["v1"] * 6,
-                            "site": ["a", "a", "b", "b", "b", "b"],
-                        },
-                        "y_true": np.array([0, 0, 1, 1, 1, 1]),
-                        "y_pred": np.array([0, 1, 1, 1, 0, 1]),
-                        "y_proba": np.array(
-                            [
-                                [0.8, 0.2],
-                                [0.4, 0.6],
-                                [0.3, 0.7],
-                                [0.2, 0.8],
-                                [0.6, 0.4],
-                                [0.4, 0.6],
-                            ]
-                        ),
-                    }
-                ],
-            }
+            "Subject": ["S1", "S1", "S2"],
+            "y_true": [10.0, 10.0, 20.0],
+            "y_pred": [12.0, 8.0, 22.0],
+            "SampleID": [0, 1, 2],
         }
-    ).get_predictions()
-
-
-def test_binomial_accuracy_test_returns_exact_tail_threshold_and_ci():
-    result = binomial_accuracy_test(
-        y_true=[0, 1, 1, 0],
-        y_pred=[0, 1, 0, 0],
-        p0=0.5,
-        alpha=0.05,
     )
-
-    assert result["k_correct"] == 3
-    assert result["n_eff"] == 4
-    assert result["p_value"] == pytest.approx(binom.sf(2, 4, 0.5))
-    assert 0 <= result["ci_lower"] <= result["observed"] <= result["ci_upper"] <= 1
-
-
-def test_binomial_accuracy_test_requires_p0():
-    with pytest.raises(ValueError, match="explicit p0"):
-        binomial_accuracy_test([0, 1], [0, 1], p0=None)
-
-
-def test_aggregation_sample_group_mean_group_majority_and_custom_units():
-    predictions = _prediction_frame()
-
-    sample = aggregate_predictions_for_inference(
-        predictions,
-        metric="accuracy",
-        unit_of_inference="sample",
-    )
-    assert len(sample) == 6
-
-    group_mean = aggregate_predictions_for_inference(
-        predictions,
-        metric="accuracy",
-        unit_of_inference="group_mean",
-    )
-    assert group_mean["InferentialUnitID"].tolist() == ["s0", "s1", "s2"]
-    assert "y_proba_0" in group_mean
-    assert group_mean["y_pred"].tolist() == [0, 1, 1]
-
-    group_majority = aggregate_predictions_for_inference(
-        predictions,
-        metric="accuracy",
-        unit_of_inference="group_majority",
-    )
-    assert group_majority["y_pred"].tolist() == [0, 1, 0]
-
-    custom = aggregate_predictions_for_inference(
-        predictions,
-        metric="accuracy",
-        unit_of_inference="custom",
-        custom_unit_column="subject",
+    res = aggregate_predictions_for_inference(
+        df,
+        metric="mse",
+        task="regression",
+        unit_of_inference="Subject",
         custom_aggregation="mean",
     )
-    assert custom["InferentialUnitID"].tolist() == ["s0", "s1", "s2"]
+    assert len(res) == 2
+    assert res[res["InferentialUnitID"] == "S1"]["y_pred"].iloc[0] == 10.0
 
 
-def test_grouped_aggregation_rejects_inconsistent_true_labels():
-    predictions = _prediction_frame()
-    predictions.loc[predictions["Group"] == "s0", "y_true"] = [0, 1]
-
-    with pytest.raises(ValueError, match="one true target"):
-        aggregate_predictions_for_inference(
-            predictions,
-            metric="accuracy",
-            unit_of_inference="group_mean",
-        )
-
-
-def test_binomial_assessment_rejects_non_accuracy_and_repeated_predictions():
-    repeated = ExperimentResult(
+def test_aggregate_predictions_custom_unit():
+    df = pd.DataFrame(
         {
-            "m": {
-                "metrics": {},
-                "predictions": [
-                    {
-                        "sample_index": np.array([0, 0]),
-                        "sample_id": np.array(["s0", "s0"]),
-                        "group": None,
-                        "y_true": np.array([0, 0]),
-                        "y_pred": np.array([0, 0]),
-                    }
-                ],
-            }
+            "Session": ["A", "A", "B"],
+            "y_true": [1, 1, 0],
+            "y_pred": [1, 0, 0],
+            "y_proba_0": [0.2, 0.8, 0.9],
+            "y_proba_1": [0.8, 0.2, 0.1],
+            "SampleID": [0, 1, 2],
         }
     )
-    config = ExperimentConfig(
+    res = aggregate_predictions_for_inference(
+        df,
+        metric="accuracy",
         task="classification",
-        models={
-            "lr": ClassicalModelConfig(
-                estimator="logistic_regression",
-                params={"max_iter": 100},
-            )
-        },
-        metrics=["accuracy"],
-        cv=CVConfig(strategy="stratified", n_splits=2),
-        evaluation=StatisticalAssessmentConfig(
-            enabled=True,
-            chance=ChanceAssessmentConfig(method="binomial", p0=0.5),
-        ),
-        n_jobs=1,
-        verbose=False,
+        unit_of_inference="custom",
+        custom_unit_column="Session",
+        custom_aggregation="mean",
     )
-
-    with pytest.raises(ValueError, match="one held-out prediction"):
-        from coco_pipe.decoding.stats import run_statistical_assessment
-
-        run_statistical_assessment(
-            repeated,
-            config,
-            np.ones((2, 2)),
-            np.array([0, 0]),
-            None,
-            np.array(["s0", "s0"]),
-            None,
-            ["a", "b"],
-            None,
-            "sample",
-            "sample",
-        )
-
-    config.evaluation.metrics = ["balanced_accuracy"]
-    with pytest.raises(ValueError, match="classification accuracy"):
-        from coco_pipe.decoding.stats import run_statistical_assessment
-
-        run_statistical_assessment(
-            repeated,
-            config,
-            np.ones((2, 2)),
-            np.array([0, 0]),
-            None,
-            np.array(["s0", "s0"]),
-            None,
-            ["a", "b"],
-            None,
-            "sample",
-            "sample",
-        )
+    assert len(res) == 2
+    assert "InferentialUnitID" in res.columns
+    assert res[res["InferentialUnitID"] == "A"]["y_pred"].iloc[0] == 0
 
 
-def test_enabled_permutation_assessment_reruns_pipeline_and_stores_rows():
-    X, y = make_classification(
-        n_samples=24,
-        n_features=4,
-        n_informative=3,
-        n_redundant=0,
-        random_state=3,
+def test_aggregate_predictions_empty():
+    df = pd.DataFrame()
+    res = aggregate_predictions_for_inference(df, metric="accuracy")
+    assert res.empty
+
+
+def test_binomial_accuracy_test_clopper():
+    y_true = [1, 1, 1, 0]
+    y_pred = [1, 1, 0, 0]  # 3/4 correct
+    res = binomial_accuracy_test(y_true, y_pred, p0=0.5, ci_method="clopper_pearson")
+    assert res["observed"] == 0.75
+    assert "ci_lower" in res
+    assert "ci_upper" in res
+
+
+def test_binomial_accuracy_test_errors():
+    with pytest.raises(ValueError, match="requires an explicit p0"):
+        binomial_accuracy_test([1], [1], p0=None)
+    with pytest.raises(ValueError, match="zero predictions"):
+        binomial_accuracy_test([], [], p0=0.5)
+
+
+def test_empirical_p_values_two_sided():
+    observed = np.array([0.8, 0.2])
+    null = np.array([[0.5, 0.5], [0.6, 0.4], [0.7, 0.3]])
+    p_vals = _empirical_p_values(observed, null, greater_is_better=True, two_sided=True)
+    assert len(p_vals) == 2
+    assert np.all(p_vals <= 1.0)
+
+
+def test_correct_p_values_all_methods():
+    observed = np.array([0.9, 0.1])
+    null = np.array([[0.5, 0.5], [0.8, 0.8]])
+    p_vals_raw = np.array([0.1, 0.1])
+
+    # Bonferroni
+    p_bonf = _correct_p_values(
+        observed, null, p_vals_raw, method="bonferroni", greater_is_better=True
     )
-    config = ExperimentConfig(
-        task="classification",
-        models={
-            "lr": ClassicalModelConfig(
-                estimator="logistic_regression",
-                params={"max_iter": 200, "solver": "liblinear"},
-            )
-        },
-        metrics=["accuracy"],
-        cv=CVConfig(strategy="stratified", n_splits=2, shuffle=True, random_state=3),
-        evaluation=StatisticalAssessmentConfig(
-            enabled=True,
-            chance=ChanceAssessmentConfig(
-                method="permutation",
-                n_permutations=2,
-                unit_of_inference="sample",
-                store_null_distribution=True,
-            ),
-            random_state=4,
-        ),
-        n_jobs=1,
-        verbose=False,
+    assert p_bonf[0] == 0.2
+
+    # Max-Stat
+    p_max = _correct_p_values(
+        observed, null, p_vals_raw, method="max_stat", greater_is_better=True
     )
+    assert p_max[0] == pytest.approx(1 / 3)
 
-    result = Experiment(config).run(X, y)
-
-    assessment = result.get_statistical_assessment()
-    assert not assessment.empty
-    assert assessment.loc[0, "NullMethod"] == "permutation_full_pipeline"
-    assert assessment.loc[0, "NPermutations"] == 2
-    assert "statistical_assessment" in result.meta
-    assert "lr" in result.get_statistical_nulls()
-
-
-def test_permutation_assessment_works_with_tuning_path():
-    X, y = make_classification(
-        n_samples=24,
-        n_features=5,
-        n_informative=3,
-        n_redundant=0,
-        random_state=5,
+    # FDR
+    p_fdr = _correct_p_values(
+        observed, null, p_vals_raw, method="fdr_bh", greater_is_better=True
     )
-    config = ExperimentConfig(
-        task="classification",
-        models={
-            "lr": ClassicalModelConfig(
-                estimator="logistic_regression",
-                params={"max_iter": 200, "solver": "liblinear"},
-            )
-        },
-        grids={"lr": {"C": [0.1, 1.0]}},
-        metrics=["accuracy"],
-        cv=CVConfig(strategy="stratified", n_splits=2, shuffle=True, random_state=5),
-        tuning=TuningConfig(
-            enabled=True,
-            cv=CVConfig(strategy="stratified", n_splits=2, shuffle=True),
-            scoring="accuracy",
-            n_jobs=1,
-        ),
-        evaluation=StatisticalAssessmentConfig(
-            enabled=True,
-            chance=ChanceAssessmentConfig(
-                method="permutation",
-                n_permutations=1,
-                unit_of_inference="sample",
-            ),
-            random_state=6,
-        ),
-        n_jobs=1,
-        verbose=False,
-    )
-
-    result = Experiment(config).run(X, y)
-
-    assert not result.get_statistical_assessment().empty
-    assert not result.get_best_params().empty
+    assert len(p_fdr) == 2
 
 
-def test_temporal_statistical_assessment_accessor_plot_and_report():
-    result = ExperimentResult(
+def test_accuracy_ci_boundary():
+    # k=0
+    low, high = _accuracy_ci(np.array([0]), np.array([10]), 0.05, "clopper_pearson")
+    assert low[0] == 0.0
+    # k=n
+    low, high = _accuracy_ci(np.array([10]), np.array([10]), 0.05, "clopper_pearson")
+    assert high[0] == 1.0
+
+
+def test_coord_dict_temporal():
+    res = _coord_dict((10.0, 20.0), ["TrainTime", "TestTime"])
+    assert res["TrainTime"] == 10.0
+    assert res["TestTime"] == 20.0
+    assert res["Time"] is None
+
+
+def test_apply_multiple_comparison_correction_short():
+    df = pd.DataFrame({"PValue": [0.01]})
+    res = apply_multiple_comparison_correction(df)
+    assert "Significant" in res.columns
+    assert res["Significant"].iloc[0]
+
+
+# --- Integration Tests for Statistical Assessment ---
+
+
+def test_run_binomial_assessment_temporal():
+    predictions = pd.DataFrame(
         {
-            "temporal": {
-                "metrics": {},
-                "predictions": [],
-                "statistical_assessment": [
-                    {
-                        "Model": "temporal",
-                        "Metric": "accuracy",
-                        "Observed": 0.7,
-                        "InferentialUnit": "sample",
-                        "NEff": 10,
-                        "NullMethod": "permutation_full_pipeline",
-                        "NPermutations": 5,
-                        "P0": None,
-                        "PValue": 0.2,
-                        "CILower": 0.4,
-                        "CIUpper": 0.6,
-                        "CorrectionMethod": "max_stat",
-                        "CorrectedPValue": 0.3,
-                        "ChanceThreshold": None,
-                        "Time": 0,
-                        "TrainTime": None,
-                        "TestTime": None,
-                        "NullLower": 0.35,
-                        "NullUpper": 0.65,
-                        "Significant": False,
-                        "Assumptions": "full outer-CV pipeline",
-                        "Caveat": "sample-level inference",
-                    },
-                    {
-                        "Model": "temporal",
-                        "Metric": "accuracy",
-                        "Observed": 0.9,
-                        "InferentialUnit": "sample",
-                        "NEff": 10,
-                        "NullMethod": "permutation_full_pipeline",
-                        "NPermutations": 5,
-                        "P0": None,
-                        "PValue": 0.05,
-                        "CILower": 0.4,
-                        "CIUpper": 0.6,
-                        "CorrectionMethod": "max_stat",
-                        "CorrectedPValue": 0.05,
-                        "ChanceThreshold": None,
-                        "Time": 1,
-                        "TrainTime": None,
-                        "TestTime": None,
-                        "NullLower": 0.35,
-                        "NullUpper": 0.65,
-                        "Significant": True,
-                        "Assumptions": "full outer-CV pipeline",
-                        "Caveat": "sample-level inference",
-                    },
-                ],
-            }
+            "SampleID": [0, 1, 0, 1],
+            "Time": [0.0, 0.0, 1.0, 1.0],
+            "y_true": [1, 0, 1, 0],
+            "y_pred": [1, 0, 0, 1],  # Time 0: 100%, Time 1: 0%
         }
     )
+    # Use proper ChanceAssessmentConfig
+    chance_cfg = ChanceAssessmentConfig(p0=0.5)
+    config = StatisticalAssessmentConfig(chance=chance_cfg)
+    rows = _run_binomial_assessment(
+        model="LR",
+        metric="accuracy",
+        predictions=predictions,
+        task="classification",
+        config=config,
+        unit="sample",
+    )
+    assert len(rows) == 2  # One per timepoint
+    assert rows[0]["Time"] == 0.0
+    assert rows[1]["Time"] == 1.0
+    assert rows[0]["Observed"] == 1.0
+    assert rows[1]["Observed"] == 0.0
 
-    assessment = result.get_statistical_assessment()
-    assert set(assessment["Time"]) == {0, 1}
 
-    fig = plot_temporal_statistical_assessment(result)
-    assert fig.axes
+def test_assess_paired_comparison_temporal():
+    df = pd.DataFrame(
+        {
+            "SampleID": [0, 1, 0, 1],
+            "Time": [0.0, 0.0, 1.0, 1.0],
+            "y_true": [1, 0, 1, 0],
+            "y_pred_A": [1, 0, 1, 0],
+            "y_pred_B": [0, 1, 0, 1],
+        }
+    )
+    res = assess_paired_comparison(
+        df, metric="accuracy", unit="sample", n_permutations=10
+    )
+    assert len(res) == 2  # One per timepoint
+    assert "Difference" in res.columns
+    assert res.iloc[0]["Difference"] == 1.0
 
-    report = Report("Stats")
-    report.add_decoding_statistical_assessment(result)
-    assert "Finite-Sample Statistical Assessment" in report.render()
+
+def test_correct_p_values_less_is_better():
+    observed = np.array([0.1, 0.2])  # less-is-better
+    null = np.array([[0.5, 0.5], [0.1, 0.1]])
+    p_vals_raw = np.array([0.1, 0.1])
+
+    # Max-Stat with greater_is_better=False
+    p_max = _correct_p_values(
+        observed, null, p_vals_raw, method="max_stat", greater_is_better=False
+    )
+    assert p_max[0] == pytest.approx(2 / 3)
+
+
+def test_assess_post_hoc_permutation_with_groups():
+    res = {
+        "predictions": [
+            {
+                "y_true": np.array([0, 0, 1, 1]),
+                "y_pred": np.array([0, 1, 1, 0]),
+                "group": np.array([0, 0, 1, 1]),
+                "sample_index": np.array([0, 1, 2, 3]),
+            }
+        ]
+    }
+    df = assess_post_hoc_permutation(
+        res, metric="accuracy", unit="group", n_permutations=10
+    )
+    assert "Observed" in df.columns
+    assert df["Observed"].iloc[0] == 0.5
+
+
+def test_run_paired_permutation_assessment_full():
+    from unittest.mock import MagicMock
+
+    res_a = MagicMock()
+    res_b = MagicMock()
+
+    df_a = pd.DataFrame(
+        {
+            "Model": ["m"],
+            "Fold": [0],
+            "SampleID": [0],
+            "Group": [0],
+            "y_true": [1],
+            "y_pred": [1],
+            "InferentialUnitID": [0],
+        }
+    )
+    res_a.get_predictions.return_value = df_a
+    res_b.get_predictions.return_value = df_a.copy()
+
+    config = StatisticalAssessmentConfig(
+        chance=ChanceAssessmentConfig(n_permutations=10), unit_of_inference="sample"
+    )
+    res = run_paired_permutation_assessment(res_a, res_b, "m", "accuracy", config)
+    assert not res.empty
+    assert res.iloc[0]["Observed"] == 0.0

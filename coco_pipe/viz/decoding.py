@@ -333,7 +333,7 @@ def plot_fold_score_dispersion(
         ax.set_xticks(np.arange(1, len(labels) + 1))
         ax.set_xticklabels(labels)
     else:
-        ax.boxplot(values, labels=labels, showmeans=True)
+        ax.boxplot(values, tick_labels=labels, showmeans=True)
     ax.set_ylabel("Score")
     ax.set_title(title or "Fold Score Dispersion")
     ax.grid(True, axis="y", linestyle="--", alpha=0.3)
@@ -582,7 +582,10 @@ def plot_training_history(
     artifacts = _result_frame(result_or_artifacts, "get_model_artifacts")
     if model is not None and "Model" in artifacts:
         artifacts = artifacts[artifacts["Model"] == model]
-    rows = artifacts[artifacts["Key"].isin(["training_history", "validation_history"])]
+    rows = artifacts[
+        (artifacts["Key"].isin(["training", "validation"]))
+        | (artifacts["ArtifactType"] == "history")
+    ]
     if rows.empty:
         raise ValueError("No training history artifacts available to plot.")
     if ax is None:

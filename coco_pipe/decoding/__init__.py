@@ -1,5 +1,11 @@
-from .cache import make_feature_cache_key
-from .capabilities import EstimatorCapabilities, EstimatorSpec, SelectorCapabilities
+"""
+Decoding Module
+===============
+
+Core module for scientific decoding and machine learning experiments on
+electrophysiological and behavioral data.
+"""
+
 from .configs import (
     CheckpointConfig,
     ClassicalModelConfig,
@@ -17,11 +23,9 @@ from .configs import (
 )
 from .experiment import Experiment
 from .registry import (
+    EstimatorCapabilities,
     get_capabilities,
-    get_estimator_cls,
-    get_estimator_spec,
     list_capabilities,
-    list_estimator_specs,
     register_estimator,
     register_estimator_spec,
 )
@@ -33,6 +37,7 @@ from .stats import (
 )
 
 __all__ = [
+    # Configs
     "ExperimentConfig",
     "ClassicalModelConfig",
     "FoundationEmbeddingModelConfig",
@@ -46,20 +51,17 @@ __all__ = [
     "TrainerConfig",
     "TrainStageConfig",
     "StatisticalAssessmentConfig",
+    # Execution
+    "Experiment",
+    "ExperimentResult",
+    # Model Discovery & Metadata
+    "register_estimator",
+    "register_estimator_spec",
+    "get_capabilities",
+    "list_capabilities",
     "EstimatorCapabilities",
-    "EstimatorSpec",
-    "SelectorCapabilities",
-    "make_feature_cache_key",
+    # Stats Utilities
     "run_statistical_assessment",
     "binomial_accuracy_test",
     "aggregate_predictions_for_inference",
-    "register_estimator",
-    "get_estimator_cls",
-    "get_capabilities",
-    "list_capabilities",
-    "get_estimator_spec",
-    "list_estimator_specs",
-    "register_estimator_spec",
-    "Experiment",
-    "ExperimentResult",
 ]

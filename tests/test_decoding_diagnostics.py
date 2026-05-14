@@ -1,279 +1,273 @@
-import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pytest
-from sklearn.datasets import make_classification
 
-from coco_pipe.decoding import Experiment, ExperimentConfig
-from coco_pipe.decoding.configs import (
-    CalibrationConfig,
-    CVConfig,
-    LinearSVCConfig,
-    LogisticRegressionConfig,
-)
-from coco_pipe.decoding.core import ExperimentResult
-from coco_pipe.report.core import Report
-from coco_pipe.viz.decoding import (
-    plot_calibration_curve,
-    plot_confusion_matrix,
-    plot_fold_score_dispersion,
-    plot_pr_curve,
-    plot_roc_curve,
+from coco_pipe.decoding._diagnostics import (
+    confusion_matrix_frame,
+    curve_score_groups,
+    optional_values,
+    paired_unit_indices,
+    prediction_rows,
+    proba_matrix,
+    row_value,
+    scalar_prediction_frame,
+    score_frame,
+    score_rows,
+    time_value,
+    unit_indices,
 )
 
 
-def _diagnostic_result():
-    X, y = make_classification(
-        n_samples=40,
-        n_features=5,
-        n_informative=3,
-        n_redundant=0,
-        random_state=7,
-    )
-    config = ExperimentConfig(
-        task="classification",
-        models={"lr": LogisticRegressionConfig(max_iter=200)},
-        metrics=["accuracy", "roc_auc", "brier_score"],
-        cv=CVConfig(strategy="stratified", n_splits=2, shuffle=True, random_state=7),
-        n_jobs=1,
-        verbose=False,
-    )
-    return Experiment(config).run(X, y)
+def test_time_value():
+    assert time_value(0, [10, 20]) == 10
+    assert time_value(5, [10, 20]) == 5
+    assert time_value(0, None) == 0
 
 
-def test_fit_diagnostics_are_recorded_per_fold():
-    result = _diagnostic_result()
-
-    diagnostics = result.get_fit_diagnostics()
-
-    assert len(diagnostics) == 2
-    assert {"FitTime", "PredictTime", "ScoreTime", "TotalTime"}.issubset(
-        diagnostics.columns
-    )
-    assert (diagnostics["FitTime"] >= 0).all()
+def test_score_rows():
+    assert len(score_rows("m", 0, "a", 0.5)) == 1
+    assert len(score_rows("m", 0, "a", [0.5, 0.6])) == 2
+    assert len(score_rows("m", 0, "a", [[0.5, 0.6], [0.7, 0.8]])) == 4
+    assert len(score_rows("m", 0, "a", np.zeros((2, 2, 2)))) == 1
 
 
-def test_fit_diagnostics_expands_warning_records():
-    result = ExperimentResult(
-        {
-            "model": {
-                "metrics": {},
-                "predictions": [],
-                "diagnostics": [
-                    {
-                        "fit_time": 0.1,
-                        "predict_time": 0.2,
-                        "score_time": 0.3,
-                        "total_time": 0.6,
-                        "warnings": [
-                            {
-                                "stage": "fit",
-                                "category": "ConvergenceWarning",
-                                "message": "did not converge",
-                            }
-                        ],
-                    }
-                ],
-            }
-        }
-    )
+def test_prediction_rows_all_paths():
+    # 1. Standard Binary Proba (1D)
+    p_bin = {"y_true": [0, 1], "y_pred": [0, 1], "y_proba": np.array([0.2, 0.8])}
+    r_bin = prediction_rows("m", 0, p_bin)
+    assert r_bin[0]["y_proba_0"] == 0.8
+    assert r_bin[0]["y_proba_1"] == 0.2
 
-    diagnostics = result.get_fit_diagnostics()
-
-    assert diagnostics.loc[0, "Stage"] == "fit"
-    assert diagnostics.loc[0, "WarningCategory"] == "ConvergenceWarning"
-    assert "did not converge" in diagnostics.loc[0, "WarningMessage"]
-
-
-def test_confusion_roc_pr_and_calibration_accessors():
-    result = _diagnostic_result()
-
-    confusion = result.get_confusion_matrices()
-    counts = result.get_confusion_counts()
-    pooled = result.get_pooled_confusion_matrix()
-    roc = result.get_roc_curve()
-    pr = result.get_pr_curve()
-    calibration = result.get_calibration_curve(n_bins=3)
-    proba = result.get_probability_diagnostics()
-
-    assert {"TrueLabel", "PredictedLabel", "Value"}.issubset(confusion.columns)
-    assert {"TrueLabel", "PredictedLabel", "Value"}.issubset(counts.columns)
-    assert {"TrueLabel", "PredictedLabel", "Value"}.issubset(pooled.columns)
-    assert {"FPR", "TPR", "Threshold"}.issubset(roc.columns)
-    assert {"Precision", "Recall", "Threshold"}.issubset(pr.columns)
-    assert {
-        "MeanPredictedProbability",
-        "FractionPositive",
-    }.issubset(calibration.columns)
-    assert {"Metric", "Class", "Value"}.issubset(proba.columns)
-    assert not confusion.empty
-    assert not counts.empty
-    assert not pooled.empty
-    assert not roc.empty
-    assert not pr.empty
-    assert not calibration.empty
-    assert {"log_loss", "brier_score_macro"}.issubset(set(proba["Metric"]))
-
-
-def test_multiclass_curves_use_one_vs_rest_rows():
-    raw = {
-        "m": {
-            "metrics": {},
-            "predictions": [
-                {
-                    "sample_index": np.arange(6),
-                    "sample_id": np.arange(6),
-                    "group": None,
-                    "y_true": np.array([0, 1, 2, 0, 1, 2]),
-                    "y_pred": np.array([0, 1, 2, 1, 1, 0]),
-                    "y_proba": np.array(
-                        [
-                            [0.8, 0.1, 0.1],
-                            [0.1, 0.7, 0.2],
-                            [0.1, 0.2, 0.7],
-                            [0.3, 0.5, 0.2],
-                            [0.2, 0.6, 0.2],
-                            [0.4, 0.2, 0.4],
-                        ]
-                    ),
-                }
-            ],
-        }
+    # 2. Standard Multiclass Proba (2D)
+    p_multi = {
+        "y_true": [0, 1],
+        "y_pred": [0, 1],
+        "y_proba": np.array([[0.8, 0.2], [0.1, 0.9]]),
     }
+    r_multi = prediction_rows("m", 0, p_multi)
+    assert r_multi[0]["y_proba_0"] == 0.8
 
-    result = ExperimentResult(raw)
+    # 3. Sliding Proba (3D)
+    p_sl = {
+        "y_true": [0, 1],
+        "y_pred": np.zeros((2, 2)),
+        "y_proba": np.zeros((2, 2, 2)),
+    }
+    r_sl = prediction_rows("m", 0, p_sl)
+    assert "y_proba_0" in r_sl[0]
 
-    assert set(result.get_roc_curve()["Class"]) == {0, 1, 2}
-    assert set(result.get_pr_curve()["Class"]) == {0, 1, 2}
-    assert set(result.get_calibration_curve(n_bins=2)["Class"]) == {0, 1, 2}
-    assert not result.get_probability_diagnostics().empty
+    # 4. Generalizing Proba (4D)
+    p_gen = {
+        "y_true": [0, 1],
+        "y_pred": np.zeros((2, 2, 2)),
+        "y_proba": np.zeros((2, 2, 2, 2)),
+    }
+    r_gen = prediction_rows("m", 0, p_gen)
+    assert "y_proba_0" in r_gen[0]
 
+    # 5. Standard Binary Score (1D)
+    p_s1 = {"y_true": [0, 1], "y_pred": [0, 1], "y_score": np.array([0.5, 0.8])}
+    r_s1 = prediction_rows("m", 0, p_s1)
+    assert r_s1[0]["y_score"] == 0.5
 
-def test_permutation_bootstrap_and_paired_comparison_helpers():
-    X, y = make_classification(
-        n_samples=36,
-        n_features=5,
-        n_informative=3,
-        n_redundant=0,
-        random_state=9,
-    )
-    groups = np.repeat(np.arange(12), 3)
-    config = ExperimentConfig(
-        task="classification",
-        models={
-            "lr": LogisticRegressionConfig(max_iter=200),
-            "dummy": {"method": "DummyClassifier", "strategy": "prior"},
-        },
-        metrics=["accuracy"],
-        cv=CVConfig(strategy="stratified", n_splits=2, shuffle=True, random_state=9),
-        n_jobs=1,
-        verbose=False,
-    )
-    result = Experiment(config).run(X, y, groups=groups)
+    # 6. Standard Multiclass Score (2D)
+    p_sm = {
+        "y_true": [0, 1],
+        "y_pred": [0, 1],
+        "y_score": np.array([[1.0, -1.0], [-1.0, 1.0]]),
+    }
+    r_sm = prediction_rows("m", 0, p_sm)
+    assert r_sm[0]["y_score_0"] == 1.0
 
-    null = result.get_statistical_assessment(
-        lightweight=True, n_permutations=20, random_state=1
-    )
-    ci = result.get_bootstrap_confidence_intervals(
-        n_bootstraps=20,
-        unit="group",
-        random_state=1,
-    )
-    paired = result.compare_models_paired(
-        "lr",
-        "dummy",
-        n_permutations=20,
-        unit="group",
-        random_state=1,
-    )
-
-    assert {"Observed", "NullLower", "NullUpper", "PValue"}.issubset(null.columns)
-    assert {"Estimate", "CILower", "CIUpper", "NUnits"}.issubset(ci.columns)
-    assert paired.loc[0, "ModelA"] == "lr"
-    assert paired.loc[0, "ModelB"] == "dummy"
-    assert 0 <= paired.loc[0, "PValue"] <= 1
+    # 7. Metadata and Groups
+    p_meta = {
+        "y_true": [0],
+        "y_pred": [0],
+        "group": [1],
+        "sample_metadata": {"m": [10]},
+    }
+    r_meta = prediction_rows("m", 0, p_meta)
+    assert r_meta[0]["m"] == 10
+    assert r_meta[0]["Group"] == 1
 
 
-def test_calibration_wraps_training_path_with_disjoint_inner_cv():
-    config = ExperimentConfig(
-        task="classification",
-        models={"svm": LinearSVCConfig(max_iter=500)},
-        metrics=["log_loss"],
-        cv=CVConfig(strategy="stratified", n_splits=2),
-        calibration=CalibrationConfig(
-            enabled=True,
-            method="sigmoid",
-            cv=CVConfig(strategy="stratified", n_splits=2),
-        ),
-        n_jobs=1,
-        verbose=False,
-    )
-    estimator = Experiment(config)._prepare_estimator("svm", config.models["svm"])
-
-    assert estimator.__class__.__name__ == "CalibratedClassifierCV"
-    assert estimator.method == "sigmoid"
-    assert estimator.cv.__class__.__name__ == "StratifiedKFold"
+def test_row_value_ndarray():
+    assert row_value(np.array([np.array([1])], dtype=object), 0) == [1]
 
 
-def test_calibration_defaults_to_outer_group_cv_family():
-    config = ExperimentConfig(
-        task="classification",
-        models={"svm": LinearSVCConfig(max_iter=500)},
-        metrics=["log_loss"],
-        cv=CVConfig(strategy="group_kfold", n_splits=2),
-        calibration=CalibrationConfig(enabled=True, method="sigmoid"),
-        n_jobs=1,
-        verbose=False,
-    )
-
-    estimator = Experiment(config)._prepare_estimator("svm", config.models["svm"])
-
-    assert estimator.__class__.__name__ == "CalibratedClassifierCV"
-    assert estimator.cv.__class__.__name__ == "GroupKFold"
+def test_optional_values():
+    assert optional_values(None, 2).tolist() == [None, None]
+    assert optional_values([1, 2], 2).tolist() == [1, 2]
 
 
-def test_nongroup_calibration_cv_under_grouped_outer_requires_override():
-    with pytest.raises(ValueError, match="allow_nongroup_inner_cv"):
-        Experiment(
-            ExperimentConfig(
-                task="classification",
-                models={"svm": LinearSVCConfig(max_iter=500)},
-                metrics=["log_loss"],
-                cv=CVConfig(strategy="group_kfold", n_splits=2),
-                calibration=CalibrationConfig(
-                    enabled=True,
-                    method="sigmoid",
-                    cv=CVConfig(strategy="stratified", n_splits=2),
-                ),
-                n_jobs=1,
-                verbose=False,
-            )
+def test_proba_matrix():
+    assert proba_matrix(pd.DataFrame({"y_proba_0": [0.8]}), 2) is None
+    assert (
+        proba_matrix(
+            pd.DataFrame({"y_proba_0": [0.8, np.nan], "y_proba_1": [0.2, 0.8]}), 2
         )
+        is None
+    )
+    assert (
+        proba_matrix(pd.DataFrame({"y_proba_0": [0.8], "y_proba_1": [0.2]}), 2)
+        is not None
+    )
 
 
-def test_diagnostic_plots_return_matplotlib_figures():
-    result = _diagnostic_result()
+def test_unit_indices():
+    df = pd.DataFrame(
+        {
+            "SampleID": [1, 2],
+            "Group": [1, 2],
+            "Subject": [1, 2],
+            "Session": [1, 2],
+            "Site": [1, 2],
+        }
+    )
+    for u in ["sample", "epoch", "group", "subject", "session", "site"]:
+        assert len(unit_indices(df, u)) == 2
+    with pytest.raises(ValueError):
+        unit_indices(df, "unknown")
+    df_err = pd.DataFrame({"SampleID": [1], "Site": [np.nan]})
+    with pytest.raises(ValueError):
+        unit_indices(df_err, "site")
 
-    figures = [
-        plot_confusion_matrix(result),
-        plot_roc_curve(result),
-        plot_pr_curve(result),
-        plot_calibration_curve(result),
-        plot_fold_score_dispersion(result),
-    ]
 
-    for fig in figures:
-        assert isinstance(fig, plt.Figure)
-        plt.close(fig)
+def test_paired_unit_indices():
+    df = pd.DataFrame(
+        {
+            "SampleID": [1, 1],
+            "Group_A": [1, 2],
+            "Group_B": [1, 2],
+            "Subject_A": [1, 2],
+            "Subject_B": [1, 2],
+        }
+    )
+    assert len(paired_unit_indices(df, "group")) == 2
+    assert len(paired_unit_indices(df, "subject")) == 2
 
 
-def test_decoding_diagnostics_report_section_renders():
-    result = _diagnostic_result()
-    report = Report("Diagnostics")
+def test_score_frame_all():
+    df_l = pd.DataFrame({"y_true": [0, 1], "y_pred": [0, 1]})
+    assert score_frame(df_l, "accuracy") == 1.0
+    df_p = pd.DataFrame(
+        {"y_true": [0, 1], "y_proba_0": [0.8, 0.2], "y_proba_1": [0.2, 0.8]}
+    )
+    assert score_frame(df_p, "roc_auc") == 1.0
+    assert score_frame(df_p, "brier_score") < 1.0
+    df_s = pd.DataFrame({"y_true": [0, 1], "y_score": [0.5, 0.8]})
+    assert score_frame(df_s, "roc_auc") == 1.0
+    df_m = pd.DataFrame(
+        {
+            "y_true": [0, 1, 2],
+            "y_proba_0": [0.8, 0.1, 0.1],
+            "y_proba_1": [0.1, 0.8, 0.1],
+            "y_proba_2": [0.1, 0.1, 0.8],
+        }
+    )
+    assert score_frame(df_m, "roc_auc") == 1.0
+    assert score_frame(df_m, "average_precision") == 1.0
+    with pytest.raises(ValueError):
+        score_frame(df_l, "roc_auc")
 
-    report.add_decoding_diagnostics(result)
-    html = report.render()
 
-    assert "Decoding Diagnostics" in html
-    assert "Inference Context" in html
-    assert "Fold Scores" in html
-    assert "Fit Diagnostics" in html
+def test_scalar_prediction_frame():
+    df = pd.DataFrame({"Time": [0.1, np.nan]})
+    assert len(scalar_prediction_frame(df)) == 1
+    assert scalar_prediction_frame(pd.DataFrame()).empty
+
+
+def test_confusion_matrix_frame():
+    df = pd.DataFrame(
+        {"Model": ["m", "m"], "Fold": [0, 0], "y_true": [0, 1], "y_pred": [0, 1]}
+    )
+    assert not confusion_matrix_frame(df, [0, 1]).empty
+    assert confusion_matrix_frame(pd.DataFrame(columns=["Model", "Fold"]), [0, 1]).empty
+    assert "Model" in confusion_matrix_frame(df, [0, 1], group_cols=["Model"]).columns
+
+
+def test_curve_score_groups():
+    df = pd.DataFrame(
+        {
+            "Model": ["m", "m"],
+            "Fold": [0, 0],
+            "y_true": [0, 1],
+            "y_proba_0": [0.5, 0.5],
+            "y_proba_1": [0.5, 0.5],
+        }
+    )
+    assert len(list(curve_score_groups(df))) == 1
+    assert len(list(curve_score_groups(df, model="m2"))) == 0
+    df_s0 = pd.DataFrame(
+        {"Model": ["m", "m"], "Fold": [0, 0], "y_true": [0, 1], "y_score": [0.5, 0.8]}
+    )
+    assert len(list(curve_score_groups(df_s0, pos_label=0))) == 1
+    df_m = pd.DataFrame(
+        {
+            "Model": ["m"] * 3,
+            "Fold": [0] * 3,
+            "y_true": [0, 1, 2],
+            "y_proba_0": [0.8, 0.1, 0.1],
+            "y_proba_1": [0.1, 0.8, 0.1],
+            "y_proba_2": [0.1, 0.1, 0.8],
+        }
+    )
+    assert len(list(curve_score_groups(df_m))) == 3
+
+
+def test_paired_unit_indices_exhaustive():
+    df = pd.DataFrame(
+        {
+            "SampleID": [1],
+            "Group_A": [1],
+            "Subject_A": [1],
+            "Session_A": [1],
+            "Site_A": [1],
+            "Group_B": [1],
+            "Subject_B": [1],
+            "Session_B": [1],
+            "Site_B": [1],
+        }
+    )
+    for u in ["sample", "epoch", "group", "subject", "session", "site"]:
+        assert len(paired_unit_indices(df, u)) == 1
+
+
+def test_score_frame_error_paths():
+    df = pd.DataFrame({"y_true": [0, 1], "y_pred": [0, 1]})
+    with pytest.raises(ValueError, match="cannot be scored"):
+        score_frame(df, "roc_auc")
+
+    # Brier score multiclass error
+    df_m = pd.DataFrame(
+        {
+            "y_true": [0, 1, 2],
+            "y_proba_0": [0.3] * 3,
+            "y_proba_1": [0.3] * 3,
+            "y_proba_2": [0.4] * 3,
+        }
+    )
+    with pytest.raises(ValueError, match="binary classification only"):
+        score_frame(df_m, "brier_score")
+
+
+def test_prediction_rows_temporal_multiclass():
+    # Sliding Multiclass
+    p_sl = {
+        "y_true": [0],
+        "y_pred": np.zeros((1, 2)),
+        "y_proba": np.zeros((1, 2, 3)),  # (samples, times, classes)
+    }
+    r_sl = prediction_rows("m", 0, p_sl)
+    assert len(r_sl) == 2
+    assert all(f"y_proba_{c}" in r_sl[0] for c in range(3))
+
+    # Generalizing Multiclass
+    p_gen = {
+        "y_true": [0],
+        "y_pred": np.zeros((1, 2, 2)),
+        "y_proba": np.zeros((1, 2, 2, 3)),  # (samples, tr, te, classes)
+    }
+    r_gen = prediction_rows("m", 0, p_gen)
+    assert len(r_gen) == 4
+    assert all(f"y_proba_{c}" in r_gen[0] for c in range(3))

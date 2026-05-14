@@ -21,7 +21,7 @@ dependencies = [
     "scikit-learn>1.6",
     "matplotlib",
     "seaborn",
-    "scipy",
+    "scipy>=1.11.0",
     "pyyaml",
     "pydantic",
     "hydra-core",

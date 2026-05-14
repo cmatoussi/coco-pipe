@@ -20,20 +20,9 @@ accessors.
    coco_pipe.decoding.EstimatorCapabilities
    coco_pipe.decoding.SelectorCapabilities
    coco_pipe.decoding.result.ExperimentResult
-   coco_pipe.decoding.result.ExperimentResult.get_fit_diagnostics
-   coco_pipe.decoding.result.ExperimentResult.get_confusion_matrices
-   coco_pipe.decoding.result.ExperimentResult.get_confusion_counts
-   coco_pipe.decoding.result.ExperimentResult.get_pooled_confusion_matrix
-   coco_pipe.decoding.result.ExperimentResult.get_roc_curve
-   coco_pipe.decoding.result.ExperimentResult.get_pr_curve
-   coco_pipe.decoding.result.ExperimentResult.get_calibration_curve
-   coco_pipe.decoding.result.ExperimentResult.get_probability_diagnostics
-   coco_pipe.decoding.result.ExperimentResult.get_bootstrap_confidence_intervals
-   coco_pipe.decoding.result.ExperimentResult.compare_models_paired
-   coco_pipe.decoding.result.ExperimentResult.get_statistical_assessment
-   coco_pipe.decoding.result.ExperimentResult.get_statistical_nulls
-   coco_pipe.decoding.experiment.Experiment.save_results
-   coco_pipe.decoding.experiment.Experiment.load_results
+   coco_pipe.decoding.result.ExperimentResult.to_payload
+   coco_pipe.decoding.result.ExperimentResult.save
+   coco_pipe.decoding.result.ExperimentResult.load
    coco_pipe.decoding.get_estimator_cls
    coco_pipe.decoding.register_estimator
    coco_pipe.decoding.register_estimator_spec
@@ -41,7 +30,6 @@ accessors.
    coco_pipe.decoding.list_estimator_specs
    coco_pipe.decoding.get_capabilities
    coco_pipe.decoding.list_capabilities
-   coco_pipe.decoding.make_feature_cache_key
    coco_pipe.decoding.run_statistical_assessment
    coco_pipe.decoding.binomial_accuracy_test
    coco_pipe.decoding.aggregate_predictions_for_inference
@@ -58,6 +46,7 @@ accessors.
    coco_pipe.decoding.configs.TuningConfig
    coco_pipe.decoding.configs.CalibrationConfig
    coco_pipe.decoding.configs.StatisticalAssessmentConfig
+   coco_pipe.decoding.configs.ClassicalModelConfig
    coco_pipe.decoding.configs.LogisticRegressionConfig
    coco_pipe.decoding.configs.RandomForestClassifierConfig
    coco_pipe.decoding.configs.SVCConfig
@@ -75,15 +64,10 @@ accessors.
 .. autosummary::
    :toctree: generated/
 
-   coco_pipe.decoding.splitters.get_cv_splitter
-   coco_pipe.decoding.metrics.get_scorer
-   coco_pipe.decoding.metrics.get_metric_spec
-   coco_pipe.decoding.metrics.get_metric_names
-   coco_pipe.decoding.metrics.get_metric_families
-   coco_pipe.decoding.capabilities.EstimatorSpec
-   coco_pipe.decoding.capabilities.EstimatorCapabilities
-   coco_pipe.decoding.capabilities.SelectorCapabilities
-   coco_pipe.decoding.registry.list_estimators
+   coco_pipe.decoding.registry.get_estimator_cls
+   coco_pipe.decoding.registry.get_estimator_spec
+   coco_pipe.decoding.registry.get_capabilities
+   coco_pipe.decoding.registry.resolve_estimator_spec
 ```
 
 ## Dimensionality Reduction
