@@ -7,6 +7,7 @@ from coco_pipe.decoding.configs import (
     AdaBoostRegressorConfig,
     ARDRegressionConfig,
     BayesianRidgeConfig,
+    CalibrationConfig,
     ConfidenceIntervalConfig,
     CVConfig,
     DecisionTreeRegressorConfig,
@@ -268,3 +269,39 @@ def test_invalid_constructor_params_are_not_silently_dropped():
     experiment = _experiment_for_instantiation()
     with pytest.raises(ValueError, match="Failed to instantiate model 'fake'"):
         experiment._instantiate_model("fake", FakeConfig())
+
+
+def test_experiment_validation_hardening():
+    # calibration for regression
+    with pytest.raises(
+        (ValueError, ValidationError),
+        match="calibration is only available for classification",
+    ):
+        ExperimentConfig(
+            task="regression",
+            models={"lr": LogisticRegressionConfig()},
+            metrics=["neg_mean_squared_error"],
+            cv=CVConfig(strategy="kfold"),
+            calibration=CalibrationConfig(enabled=True),
+        )
+
+    # stratified for regression
+    with pytest.raises((ValueError, ValidationError), match="not valid for regression"):
+        ExperimentConfig(
+            task="regression",
+            models={"lr": LogisticRegressionConfig()},
+            metrics=["neg_mean_squared_error"],
+            cv=CVConfig(strategy="stratified"),
+        )
+
+    # FS metric mismatch
+    with pytest.raises(
+        (ValueError, ValidationError), match="is not defined|incompatible with task"
+    ):
+        ExperimentConfig(
+            task="classification",
+            models={"lr": LogisticRegressionConfig()},
+            feature_selection=FeatureSelectionConfig(
+                enabled=True, scoring="neg_mean_squared_error"
+            ),
+        )

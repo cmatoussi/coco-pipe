@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.datasets import make_classification
 
 from coco_pipe.decoding import Experiment, ExperimentResult
@@ -787,6 +788,63 @@ def test_get_selected_features_with_order_and_stability():
         stability.loc[stability["FeatureName"] == "f3", "SelectionFrequency"].iloc[0]
         == 0.5
     )
+
+
+def test_result_error_paths(tmp_path):
+    # load non-existent
+    with pytest.raises(FileNotFoundError):
+        ExperimentResult.load(tmp_path / "non_existent.pkl")
+
+    # summary empty
+    res = ExperimentResult({})
+    assert res.summary().empty
+
+    # get_detailed_scores with error in raw
+    res_err = ExperimentResult({"m1": {"error": "failed"}})
+    assert res_err.get_detailed_scores().empty
+    assert res_err.get_temporal_score_summary().empty
+    assert res_err.get_predictions().empty
+    assert res_err.get_splits().empty
+    assert res_err.get_fit_diagnostics().empty
+
+    # empty curves
+    assert res.get_roc_curve().empty
+    assert res.get_pr_curve().empty
+    assert res.get_roc_auc_summary().empty
+    assert res.get_pr_auc_summary().empty
+
+
+def test_result_save_default_path():
+    res = ExperimentResult({}, config={"output_dir": "."})
+    path = res.save()
+    assert path.exists()
+    path.unlink()
+
+
+def test_compare_models_all_pairs():
+    raw = {
+        "m1": {
+            "metrics": {"accuracy": {"mean": 0.8, "std": 0.1, "folds": [0.8, 0.8]}},
+            "predictions": [
+                {"sample_index": [0], "sample_id": ["s0"], "y_true": [0], "y_pred": [0]}
+            ],
+        },
+        "m2": {
+            "metrics": {"accuracy": {"mean": 0.7, "std": 0.1, "folds": [0.7, 0.7]}},
+            "predictions": [
+                {"sample_index": [0], "sample_id": ["s0"], "y_true": [0], "y_pred": [1]}
+            ],
+        },
+        "m3": {
+            "metrics": {"accuracy": {"mean": 0.6, "std": 0.1, "folds": [0.6, 0.6]}},
+            "predictions": [
+                {"sample_index": [0], "sample_id": ["s0"], "y_true": [0], "y_pred": [1]}
+            ],
+        },
+    }
+    res = ExperimentResult(raw)
+    comp = res.compare_models(metric="accuracy", n_permutations=5)
+    assert not comp.empty
 
 
 def test_get_feature_scores_with_pvalues():

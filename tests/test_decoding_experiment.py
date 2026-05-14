@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.datasets import make_classification
 from sklearn.linear_model import LogisticRegression
 
 from coco_pipe.decoding import Experiment, ExperimentConfig
@@ -683,3 +684,15 @@ def test_instantiate_foundation_model_fm_hub():
     with patch("coco_pipe.decoding.fm_hub.build_foundation_model") as mock_build:
         exp._instantiate_model("fm", fm_config)
         mock_build.assert_called_once()
+
+
+def test_experiment_calibration_run():
+    X, y = make_classification(n_samples=40, random_state=42)
+    config = ExperimentConfig(
+        task="classification",
+        models={"lr": LogisticRegressionConfig()},
+        calibration=CalibrationConfig(enabled=True, cv=CVConfig(n_splits=2)),
+        cv=CVConfig(n_splits=2),
+    )
+    res = Experiment(config).run(X, y)
+    assert "lr" in res.raw

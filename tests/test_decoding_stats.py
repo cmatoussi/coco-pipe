@@ -1,9 +1,14 @@
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.datasets import make_classification
 
+from coco_pipe.decoding import Experiment, ExperimentConfig
 from coco_pipe.decoding.configs import (
     ChanceAssessmentConfig,
+    CVConfig,
+    DummyClassifierConfig,
+    LogisticRegressionConfig,
     StatisticalAssessmentConfig,
 )
 from coco_pipe.decoding.stats import (
@@ -248,3 +253,66 @@ def test_run_paired_permutation_assessment_full():
     res = run_paired_permutation_assessment(res_a, res_b, "m", "accuracy", config)
     assert not res.empty
     assert res.iloc[0]["Observed"] == 0.0
+
+
+def test_aggregate_predictions_error_paths():
+    df = pd.DataFrame({"y_true": [0, 1], "y_pred": [0, 0]})
+
+    # Missing unit column
+    with pytest.raises(ValueError, match="Inference unit 'Subject' not found"):
+        aggregate_predictions_for_inference(df, "accuracy", unit_of_inference="Subject")
+
+    # Majority aggregation for regression
+    df_reg = pd.DataFrame(
+        {"y_true": [1.0, 2.0], "y_pred": [1.1, 1.9], "Subject": ["S1", "S1"]}
+    )
+    with pytest.raises(
+        ValueError, match="majority aggregation is only valid for classification"
+    ):
+        aggregate_predictions_for_inference(
+            df_reg,
+            "neg_mean_squared_error",
+            task="regression",
+            unit_of_inference="Subject",
+            custom_aggregation="majority",
+        )
+
+    # Mean aggregation without probas
+    df_class = pd.DataFrame(
+        {"y_true": [0, 1], "y_pred": [0, 0], "Subject": ["S1", "S1"]}
+    )
+    with pytest.raises(
+        ValueError, match="mean aggregation requires probability columns"
+    ):
+        aggregate_predictions_for_inference(
+            df_class,
+            "accuracy",
+            task="classification",
+            unit_of_inference="Subject",
+            custom_aggregation="mean",
+        )
+
+
+def test_binomial_test_hardening():
+    # k_alpha adjustment path (line 236)
+    res = binomial_accuracy_test([0] * 100, [0] * 100, p0=0.5, alpha=0.05)
+    assert "chance_threshold" in res
+
+
+def test_run_paired_permutation_assessment_hardening():
+    # Create two results to compare
+    X, y = make_classification(n_samples=20, random_state=42)
+    config = ExperimentConfig(
+        task="classification",
+        models={
+            "lr": LogisticRegressionConfig(),
+            "dummy": DummyClassifierConfig(),
+        },
+        cv=CVConfig(n_splits=2),
+    )
+    res = Experiment(config).run(X, y)
+
+    # Note: run_paired_permutation_assessment expects ExperimentResult objects
+    # But it is often called via result.compare_models
+    paired = res.compare_models(n_permutations=5, random_state=42)
+    assert not paired.empty

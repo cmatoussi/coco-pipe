@@ -99,9 +99,8 @@ class REVEModel(BaseFoundationModel):
     """
 
     def __init__(self, **kwargs):
-        super().__init__(
-            model_name=kwargs.get("model_name", "brain-bzh/reve-large"), **kwargs
-        )
+        model_name = kwargs.pop("model_name", "brain-bzh/reve-large")
+        super().__init__(model_name=model_name, **kwargs)
         self.provider = "reve"
 
     def get_module_cls(self) -> Type[nn.Module]:
