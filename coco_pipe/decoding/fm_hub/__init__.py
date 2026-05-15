@@ -6,6 +6,7 @@ Unified access to foundation models for both extraction and fine-tuning.
 
 from ._factory import build_foundation_model
 from .base import BaseFoundationModel, EmbeddingInfo
+from .cbramod import CBraModModel
 from .reve import REVEModel
 
 __all__ = [
@@ -13,4 +14,5 @@ __all__ = [
     "EmbeddingInfo",
     "build_foundation_model",
     "REVEModel",
+    "CBraModModel",
 ]

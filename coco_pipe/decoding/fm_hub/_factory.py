@@ -8,6 +8,7 @@ from typing import Any
 
 _PROVIDER_MAP = {
     "reve": (".reve", "REVEModel"),
+    "cbramod": (".cbramod", "CBraModModel"),
     "custom": (".custom", "CustomNeuralModel"),
 }
 
@@ -46,6 +47,8 @@ def build_foundation_model(config: Any) -> Any:
         "device": getattr(config, "device", None),
         "token": getattr(config, "token", None),
         "task": getattr(config, "task", "classification"),
+        "patch_size": getattr(config, "patch_size", 200),
+        "seq_len": getattr(config, "seq_len", 4),
     }
 
     # Filter out None values to allow class defaults to take over

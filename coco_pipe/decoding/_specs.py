@@ -591,6 +591,17 @@ ESTIMATOR_SPECS: dict[str, EstimatorSpec] = {
         feature_selection=("disabled",),
         dependency_extra="torch",
     ),
+    "cbramod": _spec(
+        "CBraModModel",
+        "coco_pipe.decoding.fm_hub:CBraModModel",
+        "foundation",
+        _BOTH_TASKS,
+        input_kinds=("epoched",),
+        supports_calibration=False,
+        fit_smoke_required=False,
+        feature_selection=("disabled",),
+        dependency_extra="torch",
+    ),
 }
 
 SELECTOR_CAPABILITIES: dict[str, SelectorCapabilities] = {
