@@ -1,3 +1,4 @@
+exclude: '^coco_pipe/decoding/fm_hub/cbramod_src/'
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
